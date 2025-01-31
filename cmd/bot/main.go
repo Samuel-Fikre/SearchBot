@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"SearchBot/internal/ai"
+	"SearchBot/internal/bot"
 	"SearchBot/internal/models"
 	"SearchBot/internal/search"
 	"SearchBot/internal/storage"
@@ -20,6 +21,7 @@ var (
 	mongoStorage *storage.MongoStorage
 	meiliSearch *search.MeiliSearch
 	geminiAI    *ai.GeminiAI
+	searchBot   *bot.Bot
 )
 
 func init() {
@@ -67,29 +69,31 @@ func main() {
 		log.Fatal("TELEGRAM_BOT_TOKEN is not set in .env file")
 	}
 
-	// Initialize bot
-	bot, err := tgbotapi.NewBotAPI(botToken)
+	// Initialize bot API
+	api, err := tgbotapi.NewBotAPI(botToken)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	bot.Debug = true
-	log.Printf("Authorized on account %s", bot.Self.UserName)
+	api.Debug = true
+	log.Printf("Authorized on account %s", api.Self.UserName)
+
+	// Initialize bot handler
+	searchBot = bot.NewBot(api, geminiAI, meiliSearch)
 
 	// Set up updates configuration
 	updateConfig := tgbotapi.NewUpdate(0)
 	updateConfig.Timeout = 60
-	// Add allowed update types
 	updateConfig.AllowedUpdates = []string{"message", "channel_post", "my_chat_member"}
 
 	// Get updates channel
-	updates := bot.GetUpdatesChan(updateConfig)
+	updates := api.GetUpdatesChan(updateConfig)
 
 	// Handle updates
 	for update := range updates {
 		// Handle bot being added to a group
 		if update.MyChatMember != nil {
-			handleChatMemberUpdate(bot, update.MyChatMember)
+			handleChatMemberUpdate(api, update.MyChatMember)
 			continue
 		}
 
@@ -100,7 +104,7 @@ func main() {
 
 			// Handle commands
 			if update.Message.IsCommand() {
-				handleCommand(bot, update.Message)
+				handleCommand(api, update.Message)
 				continue
 			}
 
@@ -112,9 +116,9 @@ func main() {
 	}
 }
 
-func handleChatMemberUpdate(bot *tgbotapi.BotAPI, update *tgbotapi.ChatMemberUpdated) {
+func handleChatMemberUpdate(api *tgbotapi.BotAPI, update *tgbotapi.ChatMemberUpdated) {
 	// Check if the bot was added to a group
-	if update.NewChatMember.User.ID == bot.Self.ID {
+	if update.NewChatMember.User.ID == api.Self.ID {
 		switch update.NewChatMember.Status {
 		case "member", "administrator":
 			// Bot was added to group or made admin
@@ -124,14 +128,14 @@ func handleChatMemberUpdate(bot *tgbotapi.BotAPI, update *tgbotapi.ChatMemberUpd
 				"- Read Messages\n"+
 				"- Send Messages\n\n"+
 				"Use /help to see available commands.")
-			if _, err := bot.Send(msg); err != nil {
+			if _, err := api.Send(msg); err != nil {
 				log.Printf("Error sending welcome message: %v", err)
 			}
 		}
 	}
 }
 
-func handleCommand(bot *tgbotapi.BotAPI, message *tgbotapi.Message) {
+func handleCommand(api *tgbotapi.BotAPI, message *tgbotapi.Message) {
 	msg := tgbotapi.NewMessage(message.Chat.ID, "")
 
 	switch message.Command() {
@@ -149,11 +153,11 @@ func handleCommand(bot *tgbotapi.BotAPI, message *tgbotapi.Message) {
 			chatMemberConfig := tgbotapi.GetChatMemberConfig{
 				ChatConfigWithUser: tgbotapi.ChatConfigWithUser{
 					ChatID: message.Chat.ID,
-					UserID: bot.Self.ID,
+					UserID: api.Self.ID,
 				},
 			}
 			
-			member, err := bot.GetChatMember(chatMemberConfig)
+			member, err := api.GetChatMember(chatMemberConfig)
 			if err != nil {
 				msg.Text = "Error checking bot status."
 				log.Printf("Error getting bot member info: %v", err)
@@ -178,7 +182,10 @@ func handleCommand(bot *tgbotapi.BotAPI, message *tgbotapi.Message) {
 		if query == "" {
 			msg.Text = "Please provide a search query. Example: /search golang"
 		} else {
-			results, err := meiliSearch.Search(query)
+			// Create a simple search strategy
+			searchStrategy := fmt.Sprintf(`{"key_terms":["%s"],"relevance_criteria":"messages containing the search term","search_query":"%s"}`, query, query)
+
+			results, err := meiliSearch.SearchMessages(context.Background(), searchStrategy)
 			if err != nil {
 				msg.Text = "Sorry, an error occurred while searching."
 				log.Printf("Search error: %v", err)
@@ -192,95 +199,41 @@ func handleCommand(bot *tgbotapi.BotAPI, message *tgbotapi.Message) {
 			}
 		}
 	case "ask":
-		question := message.CommandArguments()
-		if question == "" {
-			msg.Text = "Please ask me anything! I'll try to find relevant messages and answer your question. Don't worry about perfect grammar - just ask naturally!"
-		} else {
-			log.Printf("Processing /ask command with question: %s", question)
-			
-			// First, let AI understand the question and formulate a search strategy
-			searchContext := fmt.Sprintf(
-				"You are a search assistant. A user has asked: '%s'\n"+
-				"Please analyze this question and provide:\n"+
-				"1. What key concepts or terms we should search for\n"+
-				"2. What kind of information would be relevant\n"+
-				"Format your response as JSON with fields: searchTerms (array of strings), relevanceCriteria (string)",
-				question)
-			
-			searchStrategy, err := geminiAI.AnswerQuestion(context.Background(), searchContext, nil)
-			if err != nil {
-				msg.Text = "Sorry, I'm having trouble understanding the question. Could you rephrase it?"
-				log.Printf("AI error in search strategy: %v", err)
-				break
-			}
-			
-			log.Printf("AI generated search strategy: %s", searchStrategy)
-			
-			// Now search for relevant messages using the AI's strategy
-			results, err := meiliSearch.Search("localstack") // We'll use a simple term for now
-			if err != nil {
-				msg.Text = "Sorry, I ran into an error while searching."
-				log.Printf("Search error: %v", err)
-			} else if len(results) == 0 {
-				msg.Text = "I understand you're asking about that topic, but I haven't seen any messages about it yet."
-				log.Printf("No messages found for search strategy")
-			} else {
-				log.Printf("Found %d relevant messages", len(results))
-				
-				// Build context from messages
-				var contextBuilder string
-				for i, result := range results {
-					contextBuilder += fmt.Sprintf("Message %d from @%s: %s\n", i+1, result.Username, result.Text)
-					log.Printf("Message %d: %s: %s", i+1, result.Username, result.Text)
-				}
-				
-				// Now ask AI to analyze the messages and answer the question
-				prompt := fmt.Sprintf(
-					"A user asked: '%s'\n\n"+
-					"Here are some relevant messages from the chat:\n%s\n\n"+
-					"Please provide a natural, conversational response that:\n"+
-					"1. Directly answers their question based on the chat messages\n"+
-					"2. Acknowledges what information is and isn't available\n"+
-					"3. Maintains a helpful and friendly tone",
-					question, contextBuilder)
-				
-				answer, err := geminiAI.AnswerQuestion(context.Background(), prompt, results)
-				if err != nil {
-					msg.Text = "Sorry, I couldn't generate an answer right now. Try asking in a different way?"
-					log.Printf("Gemini error: %v", err)
-				} else {
-					log.Printf("Gemini generated answer: %s", answer)
-					msg.Text = answer
-				}
+		if err := searchBot.HandleAskCommand(context.Background(), message); err != nil {
+			log.Printf("Error handling ask command: %v", err)
+			msg.Text = "An error occurred while processing your question."
+			if _, err := api.Send(msg); err != nil {
+				log.Printf("Error sending error message: %v", err)
 			}
 		}
+		return
 	default:
 		msg.Text = "Unknown command. Use /help to see available commands."
 	}
 
-	if _, err := bot.Send(msg); err != nil {
+	if _, err := api.Send(msg); err != nil {
 		log.Printf("Error sending message: %v", err)
 	}
 }
 
-func storeMessage(message *tgbotapi.Message) {
-	msg := &models.Message{
-		MessageID: int64(message.MessageID),
-		ChatID:    message.Chat.ID,
-		UserID:    message.From.ID,
-		Username:  message.From.UserName,
-		Text:      message.Text,
-		CreatedAt: time.Now(),
+func storeMessage(msg *tgbotapi.Message) {
+	// Create message model
+	message := &models.Message{
+		MessageID: int64(msg.MessageID),
+		ChatID:    msg.Chat.ID,
+		UserID:    int64(msg.From.ID),
+		Username:  msg.From.UserName,
+		Text:      msg.Text,
+		CreatedAt: time.Unix(int64(msg.Date), 0),
 	}
 
 	// Store in MongoDB
-	if err := mongoStorage.StoreMessage(msg); err != nil {
+	if err := mongoStorage.StoreMessage(message); err != nil {
 		log.Printf("Error storing message in MongoDB: %v", err)
-		return
 	}
 
 	// Index in Meilisearch
-	if err := meiliSearch.IndexMessage(msg); err != nil {
+	if err := meiliSearch.IndexMessage(message); err != nil {
 		log.Printf("Error indexing message in Meilisearch: %v", err)
 	}
 }
