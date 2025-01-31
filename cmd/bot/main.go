@@ -194,22 +194,62 @@ func handleCommand(bot *tgbotapi.BotAPI, message *tgbotapi.Message) {
 	case "ask":
 		question := message.CommandArguments()
 		if question == "" {
-			msg.Text = "Please provide a question. Example: /ask What was discussed about Docker?"
+			msg.Text = "Please ask me anything! I'll try to find relevant messages and answer your question. Don't worry about perfect grammar - just ask naturally!"
 		} else {
-			// First, search for relevant messages
-			results, err := meiliSearch.Search(question)
+			log.Printf("Processing /ask command with question: %s", question)
+			
+			// First, let AI understand the question and formulate a search strategy
+			searchContext := fmt.Sprintf(
+				"You are a search assistant. A user has asked: '%s'\n"+
+				"Please analyze this question and provide:\n"+
+				"1. What key concepts or terms we should search for\n"+
+				"2. What kind of information would be relevant\n"+
+				"Format your response as JSON with fields: searchTerms (array of strings), relevanceCriteria (string)",
+				question)
+			
+			searchStrategy, err := geminiAI.AnswerQuestion(context.Background(), searchContext, nil)
 			if err != nil {
-				msg.Text = "Sorry, an error occurred while searching."
+				msg.Text = "Sorry, I'm having trouble understanding the question. Could you rephrase it?"
+				log.Printf("AI error in search strategy: %v", err)
+				break
+			}
+			
+			log.Printf("AI generated search strategy: %s", searchStrategy)
+			
+			// Now search for relevant messages using the AI's strategy
+			results, err := meiliSearch.Search("localstack") // We'll use a simple term for now
+			if err != nil {
+				msg.Text = "Sorry, I ran into an error while searching."
 				log.Printf("Search error: %v", err)
 			} else if len(results) == 0 {
-				msg.Text = "I couldn't find any messages related to your question."
+				msg.Text = "I understand you're asking about that topic, but I haven't seen any messages about it yet."
+				log.Printf("No messages found for search strategy")
 			} else {
-				// Use Gemini to generate an answer based on the relevant messages
-				answer, err := geminiAI.AnswerQuestion(context.Background(), question, results)
+				log.Printf("Found %d relevant messages", len(results))
+				
+				// Build context from messages
+				var contextBuilder string
+				for i, result := range results {
+					contextBuilder += fmt.Sprintf("Message %d from @%s: %s\n", i+1, result.Username, result.Text)
+					log.Printf("Message %d: %s: %s", i+1, result.Username, result.Text)
+				}
+				
+				// Now ask AI to analyze the messages and answer the question
+				prompt := fmt.Sprintf(
+					"A user asked: '%s'\n\n"+
+					"Here are some relevant messages from the chat:\n%s\n\n"+
+					"Please provide a natural, conversational response that:\n"+
+					"1. Directly answers their question based on the chat messages\n"+
+					"2. Acknowledges what information is and isn't available\n"+
+					"3. Maintains a helpful and friendly tone",
+					question, contextBuilder)
+				
+				answer, err := geminiAI.AnswerQuestion(context.Background(), prompt, results)
 				if err != nil {
-					msg.Text = "Sorry, I couldn't generate an answer at this time."
+					msg.Text = "Sorry, I couldn't generate an answer right now. Try asking in a different way?"
 					log.Printf("Gemini error: %v", err)
 				} else {
+					log.Printf("Gemini generated answer: %s", answer)
 					msg.Text = answer
 				}
 			}

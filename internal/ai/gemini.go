@@ -3,6 +3,7 @@ package ai
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"SearchBot/internal/models"
 
@@ -35,24 +36,38 @@ func (g *GeminiAI) Close() {
 	g.client.Close()
 }
 
-func (g *GeminiAI) AnswerQuestion(ctx context.Context, question string, relevantMessages []models.Message) (string, error) {
-	// Create context from relevant messages
-	context := "Based on the following messages:\n\n"
-	for _, msg := range relevantMessages {
-		context += fmt.Sprintf("From @%s: %s\n", msg.Username, msg.Text)
+func (g *GeminiAI) AnswerQuestion(ctx context.Context, question string, messages []models.Message) (string, error) {
+	// If no messages provided, this is a direct question to AI (e.g., for search strategy)
+	if messages == nil {
+		return g.generateResponse(ctx, question)
 	}
-	context += "\n\nQuestion: " + question + "\n\nPlease provide a concise and relevant answer based on the messages above."
 
-	// Generate response
-	resp, err := g.model.GenerateContent(ctx, genai.Text(context))
+	// If messages provided, we're generating an answer based on chat context
+	var prompt strings.Builder
+	prompt.WriteString(question)
+	
+	if len(messages) > 0 {
+		prompt.WriteString("\n\nContext from chat messages:\n")
+		for i, msg := range messages {
+			prompt.WriteString(fmt.Sprintf("%d. @%s: %s\n", i+1, msg.Username, msg.Text))
+		}
+	}
+
+	return g.generateResponse(ctx, prompt.String())
+}
+
+func (g *GeminiAI) generateResponse(ctx context.Context, prompt string) (string, error) {
+	// Generate content directly using the model
+	resp, err := g.model.GenerateContent(ctx, genai.Text(prompt))
 	if err != nil {
-		return "", fmt.Errorf("failed to generate response: %v", err)
+		return "", fmt.Errorf("failed to generate content: %v", err)
 	}
 
 	if len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
 		return "", fmt.Errorf("no response generated")
 	}
 
-	answer := resp.Candidates[0].Content.Parts[0].(genai.Text)
-	return string(answer), nil
+	// Get the response text
+	response := resp.Candidates[0].Content.Parts[0].(genai.Text)
+	return string(response), nil
 } 
