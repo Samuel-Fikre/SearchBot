@@ -191,7 +191,7 @@ func handleCommand(api *tgbotapi.BotAPI, message *tgbotapi.Message) {
 				Sort: []string{"created_at:desc"},
 			}
 
-			results, err := meiliSearch.SearchMessages(context.Background(), searchReq)
+			results, err := meiliSearch.SearchMessages(message.Chat.ID, searchReq)
 			if err != nil {
 				msg.Text = "Sorry, an error occurred while searching."
 				log.Printf("Search error: %v", err)

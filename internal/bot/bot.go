@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"time"
@@ -41,6 +42,26 @@ func (b *Bot) sendMessage(chatID int64, text string) error {
 
 // HandleAskCommand handles the /ask command
 func (b *Bot) HandleAskCommand(ctx context.Context, msg *tgbotapi.Message) error {
+	// First check if bot has necessary permissions
+	chatMember, err := b.api.GetChatMember(tgbotapi.GetChatMemberConfig{
+		ChatConfigWithUser: tgbotapi.ChatConfigWithUser{
+			ChatID: msg.Chat.ID,
+			UserID: b.api.Self.ID,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to check bot permissions: %v", err)
+	}
+
+	// Check if bot is admin and has message access
+	if chatMember.Status != "administrator" {
+		return b.sendMessage(msg.Chat.ID, 
+			"⚠️ I need to be an administrator to access message history.\n"+
+			"Please make me an administrator with these permissions:\n"+
+			"- Read Messages\n"+
+			"- Send Messages")
+	}
+
 	// Extract the question from the message
 	question := strings.TrimSpace(strings.TrimPrefix(msg.Text, "/ask"))
 	if question == "" {
@@ -55,9 +76,18 @@ func (b *Bot) HandleAskCommand(ctx context.Context, msg *tgbotapi.Message) error
 		Sort: []string{"created_at:desc"}, // Most recent first
 	}
 	
-	messages, err := b.search.SearchMessages(ctx, searchReq)
+	messages, err := b.search.SearchMessages(msg.Chat.ID, searchReq)
 	if err != nil {
 		return fmt.Errorf("failed to fetch messages: %v", err)
+	}
+
+	if len(messages) == 0 {
+		return b.sendMessage(msg.Chat.ID, 
+			"I don't have any messages in my database yet. "+
+			"This could be because:\n"+
+			"1. I was just added to the group\n"+
+			"2. I don't have access to read messages\n"+
+			"Please make sure I'm an administrator with message access and wait for new messages to be indexed.")
 	}
 
 	// Format all messages for AI analysis
@@ -89,11 +119,15 @@ When you find relevant messages:
 1. Explain WHY these messages are relevant to their question
 2. Point out the semantic connections (e.g. "DeepSeek is an AI model that was discussed here")
 3. Include enough context to understand the discussion
+4. IMPORTANT: You MUST include the EXACT messages in your response, including username and text
 
 Your response must be a raw JSON object with NO FORMATTING AT ALL.
 Example: {"relevant_messages":["@username: exact message text"],"explanation":"why these messages are helpful"}
 
-Remember: Focus on finding messages that would actually help them, even if the messages use completely different terminology.`, 
+Remember: 
+1. Focus on finding messages that would actually help them, even if the messages use completely different terminology
+2. You MUST include the EXACT messages in your response, do not paraphrase or summarize them
+3. Include ALL relevant messages, even if they seem similar`, 
 		question, messagesText.String())
 
 	analysis, err := b.ai.AnswerQuestion(ctx, analysisPrompt, nil)
@@ -112,7 +146,20 @@ Remember: Focus on finding messages that would actually help them, even if the m
 		return fmt.Errorf("failed to parse analysis: %v", err)
 	}
 
-	// If no relevant messages found
+	// If no relevant messages found in AI response, try to find them ourselves
+	if len(result.RelevantMessages) == 0 {
+		// Search for messages containing keywords from the question
+		keywords := extractSignificantTerms(question)
+		for _, message := range messages {
+			messageTerms := extractSignificantTerms(message.Text)
+			if hasCommonTerms(keywords, messageTerms) {
+				result.RelevantMessages = append(result.RelevantMessages, 
+					fmt.Sprintf("@%s: %s", message.Username, message.Text))
+			}
+		}
+	}
+
+	// If still no relevant messages found
 	if len(result.RelevantMessages) == 0 {
 		return b.sendMessage(msg.Chat.ID, "I couldn't find any relevant discussions about this topic in our chat history. You might be the first one to bring this up!")
 	}
@@ -127,8 +174,14 @@ Remember: Focus on finding messages that would actually help them, even if the m
 
 	baseOffset := len(result.Explanation) + len("\n\nHere are the relevant discussions:\n\n")
 	
-	for i, relevantMsg := range result.RelevantMessages {
-		// Extract message details
+	// Group messages by conversation
+	var currentUsername string
+	var currentConversation []models.Message
+	var allConversations [][]models.Message
+
+	// First, convert relevant messages to actual Message objects
+	var relevantMessages []models.Message
+	for _, relevantMsg := range result.RelevantMessages {
 		parts := strings.SplitN(relevantMsg, ": ", 2)
 		if len(parts) != 2 {
 			continue
@@ -136,47 +189,80 @@ Remember: Focus on finding messages that would actually help them, even if the m
 		username := strings.TrimPrefix(parts[0], "@")
 		messageText := parts[1]
 
-		// Find the corresponding message from our fetched messages
-		var messageID int64
+		// Find the corresponding message
 		for _, m := range messages {
 			if m.Username == username && m.Text == messageText {
-				messageID = m.MessageID
+				relevantMessages = append(relevantMessages, m)
 				break
 			}
 		}
+	}
 
-		// Format the message with a number and full text
-		messageNum := fmt.Sprintf("%d. ", i+1)
-		fullMessage := fmt.Sprintf("%s@%s: %s\n", messageNum, username, messageText)
-		response.WriteString(fullMessage)
-
-		// Create a text_link entity for the entire message line if we have the message ID
-		if messageID != 0 {
-			chatIDStr := fmt.Sprintf("%d", msg.Chat.ID)
-			if strings.HasPrefix(chatIDStr, "-100") {
-				chatIDStr = chatIDStr[4:]
+	// Group messages by username
+	for _, msg := range relevantMessages {
+		if currentUsername == "" {
+			currentUsername = msg.Username
+		}
+		
+		if msg.Username != currentUsername {
+			if len(currentConversation) > 0 {
+				allConversations = append(allConversations, currentConversation)
+				currentConversation = nil
 			}
-			
-			// Add mention entity for the username
-			entities = append(entities, tgbotapi.MessageEntity{
-				Type:   "mention",
-				Offset: baseOffset + len(messageNum),
-				Length: len("@" + username),
-			})
+			currentUsername = msg.Username
+		}
+		currentConversation = append(currentConversation, msg)
+	}
+	if len(currentConversation) > 0 {
+		allConversations = append(allConversations, currentConversation)
+	}
+
+	// Format conversations with numbers
+	for i, conversation := range allConversations {
+		// Format the conversation
+		for j, message := range conversation {
+			// Format the message
+			var fullMessage string
+			if j == 0 {
+				fullMessage = fmt.Sprintf("%d. @%s: %s\n", i+1, message.Username, message.Text)
+			} else {
+				fullMessage = fmt.Sprintf("@%s: %s\n", message.Username, message.Text)
+			}
+			response.WriteString(fullMessage)
+
+			// Create a text_link entity for the entire message line
+			chatIDStr := fmt.Sprintf("%d", message.ChatID)
+			// For supergroups, remove the -100 prefix and any remaining minus sign
+			log.Printf("Original chatID: %s", chatIDStr)
+			if strings.HasPrefix(chatIDStr, "-100") {
+				chatIDStr = chatIDStr[4:] // Remove -100 prefix
+			} else if strings.HasPrefix(chatIDStr, "-") {
+				chatIDStr = chatIDStr[1:] // Remove single - prefix
+			}
+			log.Printf("Final chatID: %s, messageID: %d", chatIDStr, message.MessageID)
 			
 			// Add text_link entity for the entire message line
+			messageURL := fmt.Sprintf("https://t.me/c/%s/%d", chatIDStr, message.MessageID)
+			log.Printf("Generated URL: %s", messageURL)
 			entities = append(entities, tgbotapi.MessageEntity{
 				Type:   "text_link",
 				Offset: baseOffset,
 				Length: len(fullMessage) - 1, // -1 to exclude the newline
-				URL:    fmt.Sprintf("https://t.me/c/%s/%d", chatIDStr, messageID),
+				URL:    messageURL,
 			})
+			
+			baseOffset += len(fullMessage)
 		}
 		
-		baseOffset += len(fullMessage)
+		// Add a newline between conversations
+		if i < len(allConversations)-1 {
+			response.WriteString("\n")
+			baseOffset += 1
+		}
 	}
 	
-	response.WriteString("\nTip: Click on any message to jump to that part of the chat history.")
+	response.WriteString("\nTip: Click on any message to jump to that part of the chat history. "+
+		"(Make sure I'm an administrator to access message history)")
 
 	// Send message with entities
 	replyMsg := tgbotapi.NewMessage(msg.Chat.ID, response.String())

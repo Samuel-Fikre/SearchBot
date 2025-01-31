@@ -1,7 +1,6 @@
 package search
 
 import (
-	"context"
 	"fmt"
 	"log"
 	"sort"
@@ -13,9 +12,10 @@ import (
 	"github.com/meilisearch/meilisearch-go"
 )
 
+// MeiliSearch handles search functionality using Meilisearch
 type MeiliSearch struct {
 	client *meilisearch.Client
-	index  string
+	baseIndexName string
 }
 
 type SearchStrategy struct {
@@ -24,133 +24,83 @@ type SearchStrategy struct {
 	SearchQuery       string   `json:"search_query,omitempty"`
 }
 
-func NewMeiliSearch(host, apiKey, index string) *MeiliSearch {
-	config := meilisearch.ClientConfig{
+// NewMeiliSearch creates a new MeiliSearch instance
+func NewMeiliSearch(host, apiKey, baseIndexName string) *MeiliSearch {
+	client := meilisearch.NewClient(meilisearch.ClientConfig{
 		Host:   host,
 		APIKey: apiKey,
-	}
-	client := meilisearch.NewClient(config)
-
-	// Try to get the index first
-	meiliIndex := client.Index(index)
-	
-	// Only create if it doesn't exist
-	_, err := meiliIndex.GetStats()
-	if err != nil {
-		log.Printf("Index doesn't exist, creating new one")
-		_, err := client.CreateIndex(&meilisearch.IndexConfig{
-			Uid:        index,
-			PrimaryKey: "message_uid",
-		})
-		if err != nil {
-			log.Printf("Warning: Index creation returned: %v", err)
-		}
-	}
-	
-	// Configure searchable attributes with weights
-	task, err := meiliIndex.UpdateSearchableAttributes(&[]string{
-		"text",
-		"username",
 	})
-	if err != nil {
-		log.Printf("Warning: Failed to update searchable attributes: %v", err)
-	} else {
-		meiliIndex.WaitForTask(task.TaskUID)
-	}
-
-	// Configure ranking rules
-	task, err = meiliIndex.UpdateRankingRules(&[]string{
-		"words",
-		"typo",
-		"proximity",
-		"attribute",
-		"sort",
-		"exactness",
-	})
-	if err != nil {
-		log.Printf("Warning: Failed to update ranking rules: %v", err)
-	} else {
-		meiliIndex.WaitForTask(task.TaskUID)
-	}
-
-	// Configure filterable attributes
-	task, err = meiliIndex.UpdateFilterableAttributes(&[]string{
-		"chat_id",
-		"user_id",
-		"message_id",
-		"created_at",
-		"username",
-	})
-	if err != nil {
-		log.Printf("Warning: Failed to update filterable attributes: %v", err)
-	} else {
-		meiliIndex.WaitForTask(task.TaskUID)
-	}
-
-	// Configure sortable attributes
-	task, err = meiliIndex.UpdateSortableAttributes(&[]string{
-		"created_at",
-	})
-	if err != nil {
-		log.Printf("Warning: Failed to update sortable attributes: %v", err)
-	} else {
-		meiliIndex.WaitForTask(task.TaskUID)
-	}
-
-	// Configure typo tolerance and other settings
-	settings := meilisearch.Settings{
-		TypoTolerance: &meilisearch.TypoTolerance{
-			Enabled: true,
-			MinWordSizeForTypos: meilisearch.MinWordSizeForTypos{
-				OneTypo: 2,  // Allow typos for words longer than 2 characters
-				TwoTypos: 3, // Allow two typos for words longer than 3 characters
-			},
-			DisableOnWords: []string{}, // Don't disable typos for any words
-			DisableOnAttributes: []string{}, // Allow typos on all attributes
-		},
-		Pagination: &meilisearch.Pagination{
-			MaxTotalHits: 100,
-		},
-	}
-
-	// Update settings
-	task, err = meiliIndex.UpdateSettings(&settings)
-	if err != nil {
-		log.Printf("Warning: Failed to update settings: %v", err)
-	} else {
-		meiliIndex.WaitForTask(task.TaskUID)
-	}
-
-	// Configure searchable attributes with weights
-	task, err = meiliIndex.UpdateSearchableAttributes(&[]string{
-		"text",
-		"username",
-	})
-	if err != nil {
-		log.Printf("Warning: Failed to update searchable attributes: %v", err)
-	} else {
-		meiliIndex.WaitForTask(task.TaskUID)
-	}
-
-	// Configure case sensitivity
-	task, err = meiliIndex.UpdateSearchableAttributes(&[]string{
-		"text",
-		"username",
-	})
-	if err != nil {
-		log.Printf("Warning: Failed to update searchable attributes: %v", err)
-	} else {
-		meiliIndex.WaitForTask(task.TaskUID)
-	}
-
 	return &MeiliSearch{
 		client: client,
-		index:  index,
+		baseIndexName: baseIndexName,
 	}
 }
 
+// getGroupIndex returns the index for a specific group
+func (m *MeiliSearch) getGroupIndex(groupID int64) *meilisearch.Index {
+	indexName := fmt.Sprintf("%s_group_%d", m.baseIndexName, groupID)
+	index := m.client.Index(indexName)
+	
+	// Ensure index exists and has proper settings
+	_, err := index.FetchInfo()
+	if err != nil {
+		// Index doesn't exist, create it with proper settings
+		task, err := m.client.CreateIndex(&meilisearch.IndexConfig{
+			Uid: indexName,
+			PrimaryKey: "message_uid",
+		})
+		if err != nil {
+			log.Printf("Error creating index: %v", err)
+			return index
+		}
+		
+		// Wait for index creation
+		_, err = m.client.WaitForTask(task.TaskUID)
+		if err != nil {
+			log.Printf("Error waiting for index creation: %v", err)
+			return index
+		}
+
+		// Configure index settings
+		_, err = index.UpdateSearchableAttributes(&[]string{
+			"text",
+			"username",
+		})
+		if err != nil {
+			log.Printf("Error updating searchable attributes: %v", err)
+		}
+
+		// Update sortable attributes
+		_, err = index.UpdateSortableAttributes(&[]string{
+			"created_at",
+			"message_id",
+		})
+		if err != nil {
+			log.Printf("Error updating sortable attributes: %v", err)
+		}
+
+		// Wait for settings to be applied
+		tasks, err := index.GetTasks(&meilisearch.TasksQuery{
+			Types: []meilisearch.TaskType{meilisearch.TaskTypeSettingsUpdate},
+		})
+		if err != nil {
+			log.Printf("Error getting tasks: %v", err)
+		} else {
+			for _, task := range tasks.Results {
+				_, err = m.client.WaitForTask(task.UID)
+				if err != nil {
+					log.Printf("Error waiting for task %d: %v", task.UID, err)
+				}
+			}
+		}
+	}
+	
+	return index
+}
+
+// IndexMessage indexes a message in the appropriate group index
 func (m *MeiliSearch) IndexMessage(msg *models.Message) error {
-	index := m.client.Index(m.index)
+	index := m.getGroupIndex(msg.ChatID)
 	
 	// Create a document for indexing with a unique message_uid field
 	document := map[string]interface{}{
@@ -166,13 +116,6 @@ func (m *MeiliSearch) IndexMessage(msg *models.Message) error {
 	// Debug log
 	log.Printf("Indexing document: %+v", document)
 
-	// First, try to get the document to see if it exists
-	var result map[string]interface{}
-	err := index.GetDocument(document["message_uid"].(string), &meilisearch.DocumentQuery{}, &result)
-	if err == nil {
-		log.Printf("Document already exists, updating: %s", document["message_uid"])
-	}
-
 	// Add the document
 	task, err := index.AddDocuments([]map[string]interface{}{document})
 	if err != nil {
@@ -180,64 +123,51 @@ func (m *MeiliSearch) IndexMessage(msg *models.Message) error {
 		return err
 	}
 
-	// Wait for the indexing task to complete
-	taskInfo, err := index.WaitForTask(task.TaskUID)
-	if err != nil {
-		log.Printf("Error waiting for indexing task: %v", err)
-		return err
-	}
-
-	// Check if the task was successful
-	if taskInfo.Status != "succeeded" {
-		log.Printf("Indexing task failed: %+v", taskInfo)
-		return fmt.Errorf("indexing task failed: %s", taskInfo.Status)
-	}
-
-	// Verify the document was indexed
-	var verifyResult map[string]interface{}
-	err = index.GetDocument(document["message_uid"].(string), &meilisearch.DocumentQuery{}, &verifyResult)
-	if err != nil {
-		log.Printf("Warning: Document not found after indexing: %v", err)
-	} else {
-		log.Printf("Successfully verified document exists: %s", document["message_uid"])
-	}
-
-	log.Printf("Successfully indexed message with ID: %s", document["message_uid"])
-	return nil
+	// Wait for indexing to complete
+	_, err = m.client.WaitForTask(task.TaskUID)
+	return err
 }
 
-func (m *MeiliSearch) SearchMessages(ctx context.Context, searchReq *meilisearch.SearchRequest) ([]models.Message, error) {
-	// Get index stats
-	index := m.client.Index(m.index)
-	stats, err := index.GetStats()
+// SearchMessages searches for messages in a specific group
+func (m *MeiliSearch) SearchMessages(groupID int64, req *meilisearch.SearchRequest) ([]models.Message, error) {
+	// Try to get messages from both possible indices (in case of group migration)
+	var allMessages []models.Message
+	
+	// First try the current group ID
+	currentIndex := m.getGroupIndex(groupID)
+	result, err := currentIndex.Search(req.Query, req)
 	if err != nil {
-		log.Printf("Error getting index stats: %v", err)
+		log.Printf("Error searching current index: %v", err)
 	} else {
-		log.Printf("Total documents in index: %d", stats.NumberOfDocuments)
+		messages := m.convertHitsToMessages(result.Hits)
+		allMessages = append(allMessages, messages...)
 	}
-
-	// If no search request provided, use default settings
-	if searchReq == nil {
-		searchReq = &meilisearch.SearchRequest{
-			Query: "",
-			Limit: 50,
-			AttributesToSearchOn: []string{"text"},
-			Sort: []string{"created_at:desc"},
+	
+	// If this is a supergroup (starts with -100), also try the old group ID
+	if groupID < -1000000000000 {
+		oldGroupID := -1 * (groupID + 1000000000000) // Convert back from supergroup ID to regular group ID
+		oldIndex := m.getGroupIndex(oldGroupID)
+		result, err := oldIndex.Search(req.Query, req)
+		if err != nil {
+			log.Printf("Error searching old index: %v", err)
+		} else {
+			messages := m.convertHitsToMessages(result.Hits)
+			allMessages = append(allMessages, messages...)
 		}
 	}
+	
+	// Sort all messages by time
+	sort.Slice(allMessages, func(i, j int) bool {
+		return allMessages[i].CreatedAt.After(allMessages[j].CreatedAt)
+	})
+	
+	return allMessages, nil
+}
 
-	// Perform the search
-	result, err := index.Search("", searchReq)
-	if err != nil {
-		log.Printf("Search error: %v", err)
-		return nil, fmt.Errorf("failed to search messages: %v", err)
-	}
-
-	log.Printf("Search results - Hits: %d", len(result.Hits))
-	log.Printf("Raw search results: %+v", result.Hits)
-
+// convertHitsToMessages converts search hits to Message objects
+func (m *MeiliSearch) convertHitsToMessages(hits []interface{}) []models.Message {
 	var messages []models.Message
-	for _, hit := range result.Hits {
+	for _, hit := range hits {
 		if doc, ok := hit.(map[string]interface{}); ok {
 			message := models.Message{}
 			
@@ -283,8 +213,7 @@ func (m *MeiliSearch) SearchMessages(ctx context.Context, searchReq *meilisearch
 			log.Printf("Warning: Could not convert hit to document: %+v (%T)", hit, hit)
 		}
 	}
-
-	return messages, nil
+	return messages
 }
 
 // fetchMessageContext fetches messages before and after each message to provide conversation context
@@ -299,7 +228,7 @@ func (m *MeiliSearch) fetchMessageContext(messages []models.Message) ([]models.M
 		uniqueMessages[msg.GetSearchID()] = msg
 	}
 	
-	index := m.client.Index(m.index)
+	index := m.client.Index(m.baseIndexName)
 	
 	// For each message, fetch context
 	for _, msg := range messages {
