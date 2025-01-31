@@ -21,22 +21,21 @@ func NewMeiliSearch(host, apiKey, index string) *MeiliSearch {
 	}
 	client := meilisearch.NewClient(config)
 
-	// Delete the index if it exists
-	if _, err := client.DeleteIndex(index); err != nil {
-		log.Printf("Warning: Failed to delete index (this is normal for first run): %v", err)
-	}
-
-	// Create a fresh index with explicit settings
-	_, err := client.CreateIndex(&meilisearch.IndexConfig{
-		Uid:        index,
-		PrimaryKey: "message_uid",
-	})
-	if err != nil {
-		log.Printf("Warning: Index creation returned: %v", err)
-	}
-
-	// Get the index
+	// Try to get the index first
 	meiliIndex := client.Index(index)
+	
+	// Only create if it doesn't exist
+	_, err := meiliIndex.GetStats()
+	if err != nil {
+		log.Printf("Index doesn't exist, creating new one")
+		_, err := client.CreateIndex(&meilisearch.IndexConfig{
+			Uid:        index,
+			PrimaryKey: "message_uid",
+		})
+		if err != nil {
+			log.Printf("Warning: Index creation returned: %v", err)
+		}
+	}
 	
 	// Configure searchable attributes with weights
 	task, err := meiliIndex.UpdateSearchableAttributes(&[]string{
@@ -125,6 +124,13 @@ func (m *MeiliSearch) IndexMessage(msg *models.Message) error {
 	// Debug log
 	log.Printf("Indexing document: %+v", document)
 
+	// First, try to get the document to see if it exists
+	var result map[string]interface{}
+	err := index.GetDocument(document["message_uid"].(string), &meilisearch.DocumentQuery{}, &result)
+	if err == nil {
+		log.Printf("Document already exists, updating: %s", document["message_uid"])
+	}
+
 	// Add the document
 	task, err := index.AddDocuments([]map[string]interface{}{document})
 	if err != nil {
@@ -145,6 +151,15 @@ func (m *MeiliSearch) IndexMessage(msg *models.Message) error {
 		return fmt.Errorf("indexing task failed: %s", taskInfo.Status)
 	}
 
+	// Verify the document was indexed
+	var verifyResult map[string]interface{}
+	err = index.GetDocument(document["message_uid"].(string), &meilisearch.DocumentQuery{}, &verifyResult)
+	if err != nil {
+		log.Printf("Warning: Document not found after indexing: %v", err)
+	} else {
+		log.Printf("Successfully verified document exists: %s", document["message_uid"])
+	}
+
 	log.Printf("Successfully indexed message with ID: %s", document["message_uid"])
 	return nil
 }
@@ -152,15 +167,22 @@ func (m *MeiliSearch) IndexMessage(msg *models.Message) error {
 func (m *MeiliSearch) Search(query string) ([]models.Message, error) {
 	index := m.client.Index(m.index)
 
+	// First, get total number of documents
+	stats, err := index.GetStats()
+	if err != nil {
+		log.Printf("Error getting index stats: %v", err)
+	} else {
+		log.Printf("Total documents in index: %d", stats.NumberOfDocuments)
+	}
+
 	// Add more search options for better matching
 	searchRes, err := index.Search(query, &meilisearch.SearchRequest{
 		Limit: 20,
 		Sort: []string{"created_at:desc"},
-		MatchingStrategy: "all", // Match all words in the query
-		AttributesToSearchOn: []string{"text"}, // Focus on message text
+		MatchingStrategy: "all", // Changed from "default" to "all" as per valid options
+		AttributesToSearchOn: []string{"text", "username"}, // Search in both text and username
 		AttributesToRetrieve: []string{"*"},    // Get all attributes
 		ShowMatchesPosition: true,
-		Filter: "created_at > 0",
 	})
 	if err != nil {
 		log.Printf("Search error: %v", err)
@@ -168,8 +190,8 @@ func (m *MeiliSearch) Search(query string) ([]models.Message, error) {
 	}
 
 	log.Printf("Search query: %s", query) // Debug log
+	log.Printf("Raw search results: %+v", searchRes) // Debug log
 	log.Printf("Number of hits: %d", len(searchRes.Hits)) // Debug log
-	log.Printf("Search results: %+v", searchRes) // Debug log
 
 	var messages []models.Message
 	for _, hit := range searchRes.Hits {
@@ -197,6 +219,9 @@ func (m *MeiliSearch) Search(query string) ([]models.Message, error) {
 			}
 			
 			messages = append(messages, message)
+			log.Printf("Converted document to message: %+v", message)
+		} else {
+			log.Printf("Warning: Could not convert hit to document: %+v", hit)
 		}
 	}
 
