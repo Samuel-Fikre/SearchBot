@@ -4,15 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"sort"
 	"strings"
 	"time"
 
 	"SearchBot/internal/ai"
+	"SearchBot/internal/models"
 	"SearchBot/internal/search"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/meilisearch/meilisearch-go"
 )
 
 // Bot handles Telegram bot functionality
@@ -46,104 +47,112 @@ func (b *Bot) HandleAskCommand(ctx context.Context, msg *tgbotapi.Message) error
 		return b.sendMessage(msg.Chat.ID, "Please provide a question after /ask")
 	}
 
-	// First, let AI understand the question and formulate a search strategy
-	searchContext := fmt.Sprintf(`You are a search assistant helping find relevant conversations in a coding group chat.
+	// First, fetch recent messages from the database
+	searchReq := &meilisearch.SearchRequest{
+		Query: "",  // Empty query to get all messages
+		Limit: 100, // Get a good number of recent messages
+		AttributesToSearchOn: []string{"text"},
+		Sort: []string{"created_at:desc"}, // Most recent first
+	}
+	
+	messages, err := b.search.SearchMessages(ctx, searchReq)
+	if err != nil {
+		return fmt.Errorf("failed to fetch messages: %v", err)
+	}
+
+	// Format all messages for AI analysis
+	var messagesText strings.Builder
+	for _, message := range messages {
+		messagesText.WriteString(fmt.Sprintf("@%s: %s\n", message.Username, message.Text))
+	}
+
+	// Let AI analyze the messages and user's question
+	analysisPrompt := fmt.Sprintf(`You are an intelligent search assistant for a coding group chat.
 A user asked: '%s'
 
-Your task is to identify key concepts and terms that would help find similar discussions.
-DO NOT try to answer the question. Instead, think about what words and phrases people might have used when discussing this topic.
+Here are ALL the recent messages from our chat:
+%s
 
-CRITICAL: Your response must be a raw JSON object with NO FORMATTING AT ALL.
-DO NOT use markdown, code blocks, backticks, newlines, or indentation.
-DO NOT add any text before or after the JSON.
+Your task is to find messages that would help answer their question, even if they use completely different terms.
+Think about:
+1. What the user is trying to find or learn about - consider synonyms, related concepts, and specific products/tools
+2. Which messages discuss relevant tools/concepts, even if they use different names
+3. Messages that mention alternatives or related approaches
+4. The context and flow of conversations - look for related messages before and after key discussions
 
-Your response should look EXACTLY like this:
-{"key_terms":["term1","term2"],"relevance_criteria":"what makes a message part of a relevant discussion"}
+For example:
+- If someone asks about "AI models" or "language models", find messages about specific AI models like ChatGPT, DeepSeek, Claude, etc.
+- If they ask about "AWS testing tools" or "local cloud testing", find messages about LocalStack
+- If they ask about "collecting website data" or "data extraction", find messages about web scraping
 
-REMEMBER: Focus on finding CONVERSATIONS where this was discussed, not answering the question.`, question)
-	
-	log.Printf("Sending prompt to AI:\n%s", searchContext)
-	
-	searchStrategy, err := b.ai.AnswerQuestion(ctx, searchContext, nil)
+When you find relevant messages:
+1. Explain WHY these messages are relevant to their question
+2. Point out the semantic connections (e.g. "DeepSeek is an AI model that was discussed here")
+3. Include enough context to understand the discussion
+
+Your response must be a raw JSON object with NO FORMATTING AT ALL.
+Example: {"relevant_messages":["@username: exact message text"],"explanation":"why these messages are helpful"}
+
+Remember: Focus on finding messages that would actually help them, even if the messages use completely different terminology.`, 
+		question, messagesText.String())
+
+	analysis, err := b.ai.AnswerQuestion(ctx, analysisPrompt, nil)
 	if err != nil {
-		msg.Text = "Sorry, I'm having trouble understanding what you're looking for. Could you rephrase it?"
-		log.Printf("AI error in search strategy: %v", err)
-		return b.sendMessage(msg.Chat.ID, msg.Text)
-	}
-	
-	log.Printf("Raw AI response:\n%s", searchStrategy)
-	
-	// Clean up the response to extract just the JSON
-	searchStrategy = strings.TrimSpace(searchStrategy)
-	searchStrategy = strings.ReplaceAll(searchStrategy, "```json", "")
-	searchStrategy = strings.ReplaceAll(searchStrategy, "```", "")
-	searchStrategy = strings.ReplaceAll(searchStrategy, "`", "")
-	searchStrategy = strings.ReplaceAll(searchStrategy, "\n", "")
-	searchStrategy = strings.ReplaceAll(searchStrategy, "\r", "")
-	searchStrategy = strings.ReplaceAll(searchStrategy, "\t", "")
-	searchStrategy = strings.ReplaceAll(searchStrategy, "  ", " ")
-	
-	// Remove any text before the first { and after the last }
-	if start := strings.Index(searchStrategy, "{"); start != -1 {
-		if end := strings.LastIndex(searchStrategy, "}"); end != -1 && end > start {
-			searchStrategy = searchStrategy[start : end+1]
-		}
-	}
-	
-	searchStrategy = strings.TrimSpace(searchStrategy)
-	
-	// Final validation
-	if !strings.HasPrefix(searchStrategy, "{") || !strings.HasSuffix(searchStrategy, "}") {
-		msg.Text = "Sorry, I'm having trouble processing your search. Could you try asking in a different way?"
-		log.Printf("Invalid JSON format - missing braces: %s", searchStrategy)
-		return b.sendMessage(msg.Chat.ID, msg.Text)
-	}
-	
-	// Validate JSON structure
-	var jsonCheck map[string]interface{}
-	if err := json.Unmarshal([]byte(searchStrategy), &jsonCheck); err != nil {
-		msg.Text = "Sorry, I'm having trouble processing your search. Could you try asking in a different way?"
-		log.Printf("JSON validation error: %v\nInvalid JSON: %s", err, searchStrategy)
-		return b.sendMessage(msg.Chat.ID, msg.Text)
-	}
-	
-	log.Printf("Valid JSON object: %+v", jsonCheck)
-	
-	// Now search for relevant messages using the AI's strategy
-	messages, err := b.search.SearchMessages(ctx, searchStrategy)
-	if err != nil {
-		return fmt.Errorf("failed to search messages: %v", err)
+		return fmt.Errorf("failed to analyze messages: %v", err)
 	}
 
-	// If no messages found, inform the user
-	if len(messages) == 0 {
-		return b.sendMessage(msg.Chat.ID, "I couldn't find any past discussions about this topic in the chat history. You might be the first one to bring this up!")
+	// Clean and parse the AI response
+	analysis = cleanJSONResponse(analysis)
+	
+	var result struct {
+		RelevantMessages []string `json:"relevant_messages"`
+		Explanation      string   `json:"explanation"`
+	}
+	if err := json.Unmarshal([]byte(analysis), &result); err != nil {
+		return fmt.Errorf("failed to parse analysis: %v", err)
 	}
 
-	// Group messages by conversation
-	conversations := groupMessagesByConversation(messages)
-	
-	// Format the response to show conversation snippets
+	// If no relevant messages found
+	if len(result.RelevantMessages) == 0 {
+		return b.sendMessage(msg.Chat.ID, "I couldn't find any relevant discussions about this topic in our chat history. You might be the first one to bring this up!")
+	}
+
+	// Format the response
 	var response strings.Builder
-	response.WriteString("I found some relevant discussions:\n\n")
+	response.WriteString(result.Explanation)
+	response.WriteString("\n\nHere are the relevant discussions:\n\n")
 	
-	for i, convo := range conversations {
-		response.WriteString(fmt.Sprintf("Conversation %d:\n", i+1))
-		for _, msg := range convo {
-			response.WriteString(fmt.Sprintf("@%s: %s\n", msg.Username, msg.Text))
-		}
-		response.WriteString("\n")
+	for i, relevantMsg := range result.RelevantMessages {
+		response.WriteString(fmt.Sprintf("%d. %s\n", i+1, relevantMsg))
 	}
 	
 	response.WriteString("\nTip: You can click on any message to jump to that part of the chat history.")
-
-	// Send the answer
+	
 	return b.sendMessage(msg.Chat.ID, response.String())
 }
 
-// groupMessagesByConversation groups messages that are part of the same conversation
-// based on time proximity and context
-func groupMessagesByConversation(messages []models.Message) [][]models.Message {
+// cleanJSONResponse cleans up the AI's response to extract valid JSON
+func cleanJSONResponse(response string) string {
+	response = strings.TrimSpace(response)
+	response = strings.ReplaceAll(response, "```json", "")
+	response = strings.ReplaceAll(response, "```", "")
+	response = strings.ReplaceAll(response, "`", "")
+	response = strings.ReplaceAll(response, "\n", "")
+	response = strings.ReplaceAll(response, "\r", "")
+	response = strings.ReplaceAll(response, "\t", "")
+	
+	// Extract JSON between first { and last }
+	start := strings.Index(response, "{")
+	end := strings.LastIndex(response, "}")
+	if start != -1 && end != -1 && end > start {
+		response = response[start:end+1]
+	}
+	
+	return strings.TrimSpace(response)
+}
+
+// groupMessagesByContext groups messages based on their semantic context
+func groupMessagesByContext(messages []models.Message, relevanceCriteria string) [][]models.Message {
 	if len(messages) == 0 {
 		return nil
 	}
@@ -153,27 +162,209 @@ func groupMessagesByConversation(messages []models.Message) [][]models.Message {
 		return messages[i].CreatedAt.Before(messages[j].CreatedAt)
 	})
 
-	// Group messages that are within 5 minutes of each other
-	const conversationTimeout = 5 * time.Minute
+	// Group messages that are semantically related and within time window
+	const conversationTimeout = 2 * time.Minute
 	var conversations [][]models.Message
 	currentConvo := []models.Message{messages[0]}
 
 	for i := 1; i < len(messages); i++ {
 		timeDiff := messages[i].CreatedAt.Sub(messages[i-1].CreatedAt)
+		
+		// Check if messages are related by:
+		// 1. Time proximity
+		// 2. Direct replies
+		// 3. Shared context (based on the AI's relevance criteria)
+		isRelated := false
+		
+		// Time proximity check
 		if timeDiff <= conversationTimeout {
-			// Same conversation
+			isRelated = true
+		}
+		
+		// Direct reply check
+		if isDirectReply(messages[i-1].Text, messages[i].Text) {
+			isRelated = true
+		}
+		
+		// Context similarity check (if messages share significant terms)
+		prevWords := extractSignificantTerms(messages[i-1].Text)
+		currWords := extractSignificantTerms(messages[i].Text)
+		if hasCommonTerms(prevWords, currWords) {
+			isRelated = true
+		}
+		
+		if isRelated {
 			currentConvo = append(currentConvo, messages[i])
 		} else {
-			// New conversation
-			conversations = append(conversations, currentConvo)
+			if len(currentConvo) > 0 {
+				conversations = append(conversations, currentConvo)
+			}
 			currentConvo = []models.Message{messages[i]}
 		}
 	}
 	
-	// Add the last conversation
 	if len(currentConvo) > 0 {
 		conversations = append(conversations, currentConvo)
 	}
 
 	return conversations
+}
+
+// extractSignificantTerms extracts meaningful terms from text
+func extractSignificantTerms(text string) []string {
+	text = strings.ToLower(text)
+	words := strings.Fields(text)
+	var terms []string
+	
+	for _, word := range words {
+		// Clean the word
+		word = strings.Trim(word, ".,!?()[]{}:;\"'")
+		
+		// Keep significant words
+		if len(word) > 3 && !isCommonWord(word) {
+			terms = append(terms, word)
+		}
+	}
+	
+	return terms
+}
+
+// hasCommonTerms checks if two sets of terms share any significant words
+func hasCommonTerms(terms1, terms2 []string) bool {
+	// Create map of first set of terms
+	termMap := make(map[string]bool)
+	for _, term := range terms1 {
+		termMap[term] = true
+	}
+	
+	// Check if any term from second set exists in map
+	for _, term := range terms2 {
+		if termMap[term] {
+			return true
+		}
+		// Also check for substring matches
+		for term1 := range termMap {
+			if len(term1) > 3 && len(term) > 3 {
+				if strings.Contains(term1, term) || strings.Contains(term, term1) {
+					return true
+				}
+			}
+		}
+	}
+	
+	return false
+}
+
+// isTopicRelated checks if two topics are related
+func isTopicRelated(topic1, topic2 string) bool {
+	// If either topic is empty, they're not related
+	if topic1 == "" || topic2 == "" {
+		return false
+	}
+	
+	// Topics are related if:
+	// 1. They are exactly the same
+	if topic1 == topic2 {
+		return true
+	}
+	
+	// 2. They are part of the same technical group
+	technicalGroups := map[string][]string{
+		"stack":   {"localstack", "aws", "cloud", "docker"},
+		"scrape":  {"crawler", "crawling", "scraping", "extract"},
+		"docker":  {"container", "localstack", "stack"},
+		"aws":     {"localstack", "cloud", "stack"},
+	}
+	
+	// Check if topics belong to the same group
+	for _, group := range technicalGroups {
+		inGroup1 := false
+		inGroup2 := false
+		for _, term := range group {
+			if strings.Contains(topic1, term) {
+				inGroup1 = true
+			}
+			if strings.Contains(topic2, term) {
+				inGroup2 = true
+			}
+		}
+		if inGroup1 && inGroup2 {
+			return true
+		}
+	}
+	
+	// 3. One contains the other
+	if strings.Contains(topic1, topic2) || strings.Contains(topic2, topic1) {
+		return true
+	}
+	
+	return false
+}
+
+// isDirectReply checks if a message is a direct reply to the previous message
+func isDirectReply(prevText, currText string) bool {
+	// Convert to lowercase for consistent matching
+	prevText = strings.ToLower(prevText)
+	currText = strings.ToLower(currText)
+	
+	// Check if it's a short response (less than 5 words) to a question
+	if strings.HasSuffix(prevText, "?") {
+		words := strings.Fields(currText)
+		if len(words) < 5 {
+			return true
+		}
+	}
+	
+	// Check if the current message references words from the previous message
+	prevWords := strings.Fields(prevText)
+	currWords := strings.Fields(currText)
+	
+	// Get significant words from previous message
+	var significantPrevWords []string
+	for _, word := range prevWords {
+		if len(word) > 3 && !isCommonWord(word) {
+			significantPrevWords = append(significantPrevWords, word)
+		}
+	}
+	
+	// Check if current message contains any significant words from previous message
+	for _, currWord := range currWords {
+		for _, prevWord := range significantPrevWords {
+			if strings.Contains(strings.ToLower(currWord), strings.ToLower(prevWord)) {
+				return true
+			}
+		}
+	}
+	
+	return false
+}
+
+// isCommonWord returns true if the word is too common to be useful for topic detection
+func isCommonWord(word string) bool {
+	word = strings.ToLower(word)
+	commonWords := map[string]bool{
+		"the": true, "be": true, "to": true, "of": true, "and": true,
+		"a": true, "in": true, "that": true, "have": true, "i": true,
+		"it": true, "for": true, "not": true, "on": true, "with": true,
+		"he": true, "as": true, "you": true, "do": true, "at": true,
+		"this": true, "but": true, "his": true, "by": true, "from": true,
+		"they": true, "we": true, "say": true, "her": true, "she": true,
+		"or": true, "an": true, "will": true, "my": true, "one": true,
+		"all": true, "would": true, "there": true, "their": true, "what": true,
+		"was": true, "were": true, "been": true, "being": true, "into": true,
+		"who": true, "whom": true, "whose": true, "which": true, "where": true,
+		"when": true, "why": true, "how": true, "any": true, "some": true,
+		"can": true, "could": true, "may": true, "might": true, "must": true,
+		"shall": true, "should": true, "about": true, "many": true, "most": true,
+		"other": true, "such": true, "than": true, "then": true, "these": true,
+		"those": true, "only": true, "very": true, "also": true, "just": true,
+		"know": true, "like": true, "time": true, "make": true, "see": true,
+		"find": true, "want": true, "does": true, "need": true, "going": true,
+		"after": true, "again": true, "our": true, "well": true, "way": true,
+		"even": true, "new": true, "because": true, "give": true, "day": true,
+		"anyone": true, "anybody": true, "anything": true, "everyone": true,
+		"everybody": true, "everything": true, "someone": true, "somebody": true,
+		"something": true, "nothing": true, "nobody": true, "none": true,
+	}
+	return commonWords[word]
 } 

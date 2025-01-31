@@ -15,6 +15,7 @@ import (
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/joho/godotenv"
+	"github.com/meilisearch/meilisearch-go"
 )
 
 var (
@@ -182,10 +183,15 @@ func handleCommand(api *tgbotapi.BotAPI, message *tgbotapi.Message) {
 		if query == "" {
 			msg.Text = "Please provide a search query. Example: /search golang"
 		} else {
-			// Create a simple search strategy
-			searchStrategy := fmt.Sprintf(`{"key_terms":["%s"],"relevance_criteria":"messages containing the search term","search_query":"%s"}`, query, query)
+			// Create search request
+			searchReq := &meilisearch.SearchRequest{
+				Query: query,
+				Limit: 50,
+				AttributesToSearchOn: []string{"text"},
+				Sort: []string{"created_at:desc"},
+			}
 
-			results, err := meiliSearch.SearchMessages(context.Background(), searchStrategy)
+			results, err := meiliSearch.SearchMessages(context.Background(), searchReq)
 			if err != nil {
 				msg.Text = "Sorry, an error occurred while searching."
 				log.Printf("Search error: %v", err)
