@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"time"
 
@@ -205,18 +206,28 @@ func (m *MeiliSearch) SearchMessages(ctx context.Context, strategyJSON string) (
 		searchTerms = []string{strategy.SearchQuery}
 	}
 
-	// Join terms with OR for broader matches
-	searchQuery := strings.Join(searchTerms, " OR ")
+	// Join terms with OR for broader matches, but add phrase matches for better relevance
+	var queryParts []string
+	for _, term := range searchTerms {
+		// Add exact phrase match with high boost
+		if strings.Contains(term, " ") {
+			queryParts = append(queryParts, fmt.Sprintf(`"%s"^4`, term))
+		}
+		// Add individual word match
+		queryParts = append(queryParts, term)
+	}
+	searchQuery := strings.Join(queryParts, " OR ")
 	log.Printf("Performing search with query: %s", searchQuery)
 
 	// Add more search options for better matching
 	searchReq := &meilisearch.SearchRequest{
 		Query: searchQuery,
-		Limit: 20,
+		Limit: 50, // Increased limit to get more context
 		MatchingStrategy: "all", // Match all terms for better relevance
 		AttributesToSearchOn: []string{"text"},
-		Sort: []string{"created_at:desc"},
+		Sort: []string{"created_at:asc"}, // Sort by time ascending to maintain conversation flow
 		ShowMatchesPosition: true,
+		Facets: []string{"chat_id", "username"}, // Add faceting for better grouping
 	}
 
 	result, err := index.Search(searchQuery, searchReq)
@@ -258,5 +269,97 @@ func (m *MeiliSearch) SearchMessages(ctx context.Context, strategyJSON string) (
 		}
 	}
 
+	// If we have enough messages, try to fetch some context around them
+	if len(messages) > 0 {
+		contextMessages, err := m.fetchMessageContext(messages)
+		if err != nil {
+			log.Printf("Warning: Error fetching message context: %v", err)
+		} else {
+			messages = contextMessages
+		}
+	}
+
 	return messages, nil
+}
+
+// fetchMessageContext fetches messages before and after each message to provide conversation context
+func (m *MeiliSearch) fetchMessageContext(messages []models.Message) ([]models.Message, error) {
+	const contextWindow = 2 * time.Minute // Look for messages within 2 minutes before and after
+	
+	// Create a map to track unique messages
+	uniqueMessages := make(map[string]models.Message)
+	
+	// Add original messages to the map
+	for _, msg := range messages {
+		uniqueMessages[msg.GetSearchID()] = msg
+	}
+	
+	index := m.client.Index(m.index)
+	
+	// For each message, fetch context
+	for _, msg := range messages {
+		// Create time range filter
+		beforeTime := msg.CreatedAt.Add(-contextWindow)
+		afterTime := msg.CreatedAt.Add(contextWindow)
+		
+		filter := fmt.Sprintf(
+			"chat_id = %d AND created_at >= %d AND created_at <= %d",
+			msg.ChatID,
+			beforeTime.Unix(),
+			afterTime.Unix(),
+		)
+		
+		// Search for context messages
+		contextReq := &meilisearch.SearchRequest{
+			Filter: filter,
+			Sort: []string{"created_at:asc"},
+			Limit: 10,
+		}
+		
+		result, err := index.Search("", contextReq)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch context: %v", err)
+		}
+		
+		// Add context messages to the map
+		for _, hit := range result.Hits {
+			if doc, ok := hit.(map[string]interface{}); ok {
+				message := models.Message{}
+				
+				if msgID, ok := doc["message_id"].(float64); ok {
+					message.MessageID = int64(msgID)
+				}
+				if chatID, ok := doc["chat_id"].(float64); ok {
+					message.ChatID = int64(chatID)
+				}
+				if userID, ok := doc["user_id"].(float64); ok {
+					message.UserID = int64(userID)
+				}
+				if username, ok := doc["username"].(string); ok {
+					message.Username = username
+				}
+				if text, ok := doc["text"].(string); ok {
+					message.Text = text
+				}
+				if timestamp, ok := doc["created_at"].(float64); ok {
+					message.CreatedAt = time.Unix(int64(timestamp), 0)
+				}
+				
+				uniqueMessages[message.GetSearchID()] = message
+			}
+		}
+	}
+	
+	// Convert map back to slice
+	var result []models.Message
+	for _, msg := range uniqueMessages {
+		result = append(result, msg)
+	}
+	
+	// Sort by time
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].CreatedAt.Before(result[j].CreatedAt)
+	})
+	
+	return result, nil
 } 
