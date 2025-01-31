@@ -122,13 +122,68 @@ Remember: Focus on finding messages that would actually help them, even if the m
 	response.WriteString(result.Explanation)
 	response.WriteString("\n\nHere are the relevant discussions:\n\n")
 	
+	// Create message entities for clickable links
+	var entities []tgbotapi.MessageEntity
+
+	baseOffset := len(result.Explanation) + len("\n\nHere are the relevant discussions:\n\n")
+	
 	for i, relevantMsg := range result.RelevantMessages {
-		response.WriteString(fmt.Sprintf("%d. %s\n", i+1, relevantMsg))
+		// Extract message details
+		parts := strings.SplitN(relevantMsg, ": ", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		username := strings.TrimPrefix(parts[0], "@")
+		messageText := parts[1]
+
+		// Find the corresponding message from our fetched messages
+		var messageID int64
+		for _, m := range messages {
+			if m.Username == username && m.Text == messageText {
+				messageID = m.MessageID
+				break
+			}
+		}
+
+		// Format the message with a number and full text
+		messageNum := fmt.Sprintf("%d. ", i+1)
+		fullMessage := fmt.Sprintf("%s@%s: %s\n", messageNum, username, messageText)
+		response.WriteString(fullMessage)
+
+		// Create a text_link entity for the entire message line if we have the message ID
+		if messageID != 0 {
+			chatIDStr := fmt.Sprintf("%d", msg.Chat.ID)
+			if strings.HasPrefix(chatIDStr, "-100") {
+				chatIDStr = chatIDStr[4:]
+			}
+			
+			// Add mention entity for the username
+			entities = append(entities, tgbotapi.MessageEntity{
+				Type:   "mention",
+				Offset: baseOffset + len(messageNum),
+				Length: len("@" + username),
+			})
+			
+			// Add text_link entity for the entire message line
+			entities = append(entities, tgbotapi.MessageEntity{
+				Type:   "text_link",
+				Offset: baseOffset,
+				Length: len(fullMessage) - 1, // -1 to exclude the newline
+				URL:    fmt.Sprintf("https://t.me/c/%s/%d", chatIDStr, messageID),
+			})
+		}
+		
+		baseOffset += len(fullMessage)
 	}
 	
-	response.WriteString("\nTip: You can click on any message to jump to that part of the chat history.")
-	
-	return b.sendMessage(msg.Chat.ID, response.String())
+	response.WriteString("\nTip: Click on any message to jump to that part of the chat history.")
+
+	// Send message with entities
+	replyMsg := tgbotapi.NewMessage(msg.Chat.ID, response.String())
+	replyMsg.Entities = entities
+	replyMsg.ParseMode = "" // Ensure no parsing mode interferes with our entities
+	_, err = b.api.Send(replyMsg)
+	return err
 }
 
 // cleanJSONResponse cleans up the AI's response to extract valid JSON

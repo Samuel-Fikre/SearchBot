@@ -1,16 +1,16 @@
 package search
 
 import (
-	"SearchBot/internal/models"
-	"encoding/json"
+	"context"
 	"fmt"
 	"log"
 	"sort"
 	"strings"
 	"time"
 
+	"SearchBot/internal/models"
+
 	"github.com/meilisearch/meilisearch-go"
-	"context"
 )
 
 type MeiliSearch struct {
@@ -79,6 +79,7 @@ func NewMeiliSearch(host, apiKey, index string) *MeiliSearch {
 		"user_id",
 		"message_id",
 		"created_at",
+		"username",
 	})
 	if err != nil {
 		log.Printf("Warning: Failed to update filterable attributes: %v", err)
@@ -96,22 +97,48 @@ func NewMeiliSearch(host, apiKey, index string) *MeiliSearch {
 		meiliIndex.WaitForTask(task.TaskUID)
 	}
 
-	// Configure typo tolerance
+	// Configure typo tolerance and other settings
 	settings := meilisearch.Settings{
 		TypoTolerance: &meilisearch.TypoTolerance{
 			Enabled: true,
 			MinWordSizeForTypos: meilisearch.MinWordSizeForTypos{
 				OneTypo: 2,  // Allow typos for words longer than 2 characters
-				TwoTypos: 4, // Allow two typos for words longer than 4 characters
+				TwoTypos: 3, // Allow two typos for words longer than 3 characters
 			},
+			DisableOnWords: []string{}, // Don't disable typos for any words
+			DisableOnAttributes: []string{}, // Allow typos on all attributes
 		},
 		Pagination: &meilisearch.Pagination{
 			MaxTotalHits: 100,
 		},
 	}
+
+	// Update settings
 	task, err = meiliIndex.UpdateSettings(&settings)
 	if err != nil {
 		log.Printf("Warning: Failed to update settings: %v", err)
+	} else {
+		meiliIndex.WaitForTask(task.TaskUID)
+	}
+
+	// Configure searchable attributes with weights
+	task, err = meiliIndex.UpdateSearchableAttributes(&[]string{
+		"text",
+		"username",
+	})
+	if err != nil {
+		log.Printf("Warning: Failed to update searchable attributes: %v", err)
+	} else {
+		meiliIndex.WaitForTask(task.TaskUID)
+	}
+
+	// Configure case sensitivity
+	task, err = meiliIndex.UpdateSearchableAttributes(&[]string{
+		"text",
+		"username",
+	})
+	if err != nil {
+		log.Printf("Warning: Failed to update searchable attributes: %v", err)
 	} else {
 		meiliIndex.WaitForTask(task.TaskUID)
 	}
@@ -179,16 +206,7 @@ func (m *MeiliSearch) IndexMessage(msg *models.Message) error {
 	return nil
 }
 
-func (m *MeiliSearch) SearchMessages(ctx context.Context, strategyJSON string) ([]models.Message, error) {
-	// Parse the search strategy
-	var strategy SearchStrategy
-	if err := json.Unmarshal([]byte(strategyJSON), &strategy); err != nil {
-		return nil, fmt.Errorf("failed to parse search strategy: %v", err)
-	}
-
-	// Log the search strategy for debugging
-	log.Printf("Search strategy: %+v", strategy)
-
+func (m *MeiliSearch) SearchMessages(ctx context.Context, searchReq *meilisearch.SearchRequest) ([]models.Message, error) {
 	// Get index stats
 	index := m.client.Index(m.index)
 	stats, err := index.GetStats()
@@ -198,84 +216,71 @@ func (m *MeiliSearch) SearchMessages(ctx context.Context, strategyJSON string) (
 		log.Printf("Total documents in index: %d", stats.NumberOfDocuments)
 	}
 
-	// Build search query from key terms
-	var searchTerms []string
-	if len(strategy.KeyTerms) > 0 {
-		searchTerms = strategy.KeyTerms
-	} else if strategy.SearchQuery != "" {
-		searchTerms = []string{strategy.SearchQuery}
-	}
-
-	// Join terms with OR for broader matches, but add phrase matches for better relevance
-	var queryParts []string
-	for _, term := range searchTerms {
-		// Add exact phrase match with high boost
-		if strings.Contains(term, " ") {
-			queryParts = append(queryParts, fmt.Sprintf(`"%s"^4`, term))
+	// If no search request provided, use default settings
+	if searchReq == nil {
+		searchReq = &meilisearch.SearchRequest{
+			Query: "",
+			Limit: 50,
+			AttributesToSearchOn: []string{"text"},
+			Sort: []string{"created_at:desc"},
 		}
-		// Add individual word match
-		queryParts = append(queryParts, term)
-	}
-	searchQuery := strings.Join(queryParts, " OR ")
-	log.Printf("Performing search with query: %s", searchQuery)
-
-	// Add more search options for better matching
-	searchReq := &meilisearch.SearchRequest{
-		Query: searchQuery,
-		Limit: 50, // Increased limit to get more context
-		MatchingStrategy: "all", // Match all terms for better relevance
-		AttributesToSearchOn: []string{"text"},
-		Sort: []string{"created_at:asc"}, // Sort by time ascending to maintain conversation flow
-		ShowMatchesPosition: true,
-		Facets: []string{"chat_id", "username"}, // Add faceting for better grouping
 	}
 
-	result, err := index.Search(searchQuery, searchReq)
+	// Perform the search
+	result, err := index.Search("", searchReq)
 	if err != nil {
+		log.Printf("Search error: %v", err)
 		return nil, fmt.Errorf("failed to search messages: %v", err)
 	}
 
-	log.Printf("Search results - Hits: %d, Query: %s", len(result.Hits), result.Query)
+	log.Printf("Search results - Hits: %d", len(result.Hits))
+	log.Printf("Raw search results: %+v", result.Hits)
 
 	var messages []models.Message
 	for _, hit := range result.Hits {
 		if doc, ok := hit.(map[string]interface{}); ok {
 			message := models.Message{}
 			
-			// More defensive type conversion
+			// More defensive type conversion with logging
 			if msgID, ok := doc["message_id"].(float64); ok {
 				message.MessageID = int64(msgID)
+				log.Printf("Converted message_id: %v", message.MessageID)
+			} else {
+				log.Printf("Warning: Could not convert message_id: %v (%T)", doc["message_id"], doc["message_id"])
+				continue
 			}
 			if chatID, ok := doc["chat_id"].(float64); ok {
 				message.ChatID = int64(chatID)
+				log.Printf("Converted chat_id: %v", message.ChatID)
+			} else {
+				log.Printf("Warning: Could not convert chat_id: %v (%T)", doc["chat_id"], doc["chat_id"])
+				continue
 			}
 			if userID, ok := doc["user_id"].(float64); ok {
 				message.UserID = int64(userID)
 			}
 			if username, ok := doc["username"].(string); ok {
 				message.Username = username
+				log.Printf("Found username: %v", message.Username)
+			} else {
+				log.Printf("Warning: Could not get username: %v (%T)", doc["username"], doc["username"])
+				continue
 			}
 			if text, ok := doc["text"].(string); ok {
 				message.Text = text
+				log.Printf("Found text: %v", message.Text)
+			} else {
+				log.Printf("Warning: Could not get text: %v (%T)", doc["text"], doc["text"])
+				continue
 			}
 			if timestamp, ok := doc["created_at"].(float64); ok {
 				message.CreatedAt = time.Unix(int64(timestamp), 0)
 			}
 			
 			messages = append(messages, message)
-			log.Printf("Found message: %s: %s", message.Username, message.Text)
+			log.Printf("Successfully converted and added message: %+v", message)
 		} else {
-			log.Printf("Warning: Could not convert hit to document: %+v", hit)
-		}
-	}
-
-	// If we have enough messages, try to fetch some context around them
-	if len(messages) > 0 {
-		contextMessages, err := m.fetchMessageContext(messages)
-		if err != nil {
-			log.Printf("Warning: Error fetching message context: %v", err)
-		} else {
-			messages = contextMessages
+			log.Printf("Warning: Could not convert hit to document: %+v (%T)", hit, hit)
 		}
 	}
 
@@ -284,7 +289,7 @@ func (m *MeiliSearch) SearchMessages(ctx context.Context, strategyJSON string) (
 
 // fetchMessageContext fetches messages before and after each message to provide conversation context
 func (m *MeiliSearch) fetchMessageContext(messages []models.Message) ([]models.Message, error) {
-	const contextWindow = 2 * time.Minute // Look for messages within 2 minutes before and after
+	const contextWindow = 30 * time.Second // Reduced from 2 minutes to 30 seconds for tighter context
 	
 	// Create a map to track unique messages
 	uniqueMessages := make(map[string]models.Message)
@@ -313,7 +318,7 @@ func (m *MeiliSearch) fetchMessageContext(messages []models.Message) ([]models.M
 		contextReq := &meilisearch.SearchRequest{
 			Filter: filter,
 			Sort: []string{"created_at:asc"},
-			Limit: 10,
+			Limit: 5, // Reduced from 10 to 5 for more focused context
 		}
 		
 		result, err := index.Search("", contextReq)
@@ -362,4 +367,27 @@ func (m *MeiliSearch) fetchMessageContext(messages []models.Message) ([]models.M
 	})
 	
 	return result, nil
+}
+
+// isCommonWord returns true if the word is too common to be useful for search
+func isCommonWord(word string) bool {
+	word = strings.ToLower(word)
+	commonWords := map[string]bool{
+		"the": true, "be": true, "to": true, "of": true, "and": true,
+		"a": true, "in": true, "that": true, "have": true, "i": true,
+		"it": true, "for": true, "not": true, "on": true, "with": true,
+		"he": true, "as": true, "you": true, "do": true, "at": true,
+		"this": true, "but": true, "his": true, "by": true, "from": true,
+		"they": true, "we": true, "say": true, "her": true, "she": true,
+		"or": true, "an": true, "will": true, "my": true, "one": true,
+		"all": true, "would": true, "there": true, "their": true, "what": true,
+		"was": true, "were": true, "been": true, "being": true, "into": true,
+		"who": true, "whom": true, "whose": true, "which": true, "where": true,
+		"when": true, "why": true, "how": true, "any": true, "some": true,
+		"can": true, "could": true, "may": true, "might": true, "must": true,
+		"shall": true, "should": true, "about": true, "many": true, "most": true,
+		"other": true, "such": true, "than": true, "then": true, "these": true,
+		"those": true, "only": true, "very": true, "also": true, "just": true,
+	}
+	return commonWords[word]
 } 
