@@ -1,0 +1,15 @@
+[build]
+builder = "go"
+buildCommand = "go build -o main ./cmd/bot"
+watchPatterns = ["./cmd/**/*.go", "./internal/**/*.go"]
+
+[deploy]
+startCommand = "./main"
+healthcheckPath = "/"
+healthcheckTimeout = 100
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10
+
+[service]
+name = "searchbot"
+autoDeploy = true  # Enable automatic deployments 

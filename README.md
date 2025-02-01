@@ -67,6 +67,46 @@ SearchBot is a powerful Telegram bot that helps you search through your group ch
      searchbot
    ```
 
+## Deployment
+
+### Using Meilisearch Cloud
+
+1. **Set up Meilisearch Cloud**
+   - Create an account at [Meilisearch Cloud](https://cloud.meilisearch.com)
+   - Create a new project and select your preferred region
+   - Generate a secure Master Key:
+     - At least 16 characters long
+     - Mix of uppercase and lowercase letters
+     - Include numbers and special characters
+     - Avoid dictionary words or patterns
+   - Save your Project URL and Master Key securely
+
+2. **Configure Railway Deployment**
+   - Fork this repository to your GitHub account
+   - Create a new project on [Railway](https://railway.app)
+   - Connect your GitHub repository
+   - Add the following environment variables:
+     ```
+     TELEGRAM_BOT_TOKEN=your_bot_token
+     MONGODB_URI=your_mongodb_uri
+     MEILISEARCH_HOST=your_meilisearch_cloud_url
+     MEILISEARCH_KEY=your_secure_master_key  # Example format: xM3i#K9$pL2*vN8@qR5
+     GEMINI_API_KEY=your_gemini_api_key
+     ```
+   - Deploy your project
+
+### Security Notes
+- Never share or commit your master key
+- Rotate the key periodically
+- Use different keys for development and production
+- Store keys in secure environment variables, never in code
+
+### Storage and Scaling
+- Meilisearch Cloud handles storage and scaling automatically
+- Choose a plan based on your expected message volume
+- Automatic backups are included
+- Monitoring and analytics available through Meilisearch Cloud dashboard
+
 ## Usage
 
 ### Adding the Bot to Your Group
