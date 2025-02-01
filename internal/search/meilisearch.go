@@ -14,8 +14,10 @@ import (
 
 // MeiliSearch handles search functionality using Meilisearch
 type MeiliSearch struct {
-	client *meilisearch.Client
+	client        *meilisearch.Client
 	baseIndexName string
+	maxRetries    int
+	retryDelay    time.Duration
 }
 
 type SearchStrategy struct {
@@ -27,239 +29,199 @@ type SearchStrategy struct {
 // NewMeiliSearch creates a new MeiliSearch instance
 func NewMeiliSearch(host, apiKey, baseIndexName string) *MeiliSearch {
 	client := meilisearch.NewClient(meilisearch.ClientConfig{
-		Host:   host,
-		APIKey: apiKey,
+		Host:    host,
+		APIKey:  apiKey,
+		Timeout: 10 * time.Second, // Add timeout
 	})
+
 	return &MeiliSearch{
-		client: client,
+		client:        client,
 		baseIndexName: baseIndexName,
+		maxRetries:    3,               // Maximum number of retries
+		retryDelay:    2 * time.Second, // Delay between retries
 	}
 }
 
-// getGroupIndex returns the index for a specific group
-func (m *MeiliSearch) getGroupIndex(groupID int64) *meilisearch.Index {
-	indexName := fmt.Sprintf("%s_group_%d", m.baseIndexName, groupID)
-	index := m.client.Index(indexName)
-	
-	// Ensure index exists and has proper settings
-	_, err := index.FetchInfo()
-	if err != nil {
-		// Index doesn't exist, create it with proper settings
-		task, err := m.client.CreateIndex(&meilisearch.IndexConfig{
-			Uid: indexName,
-			PrimaryKey: "message_uid",
-		})
-		if err != nil {
-			log.Printf("Error creating index: %v", err)
-			return index
-		}
-		
-		// Wait for index creation
-		_, err = m.client.WaitForTask(task.TaskUID)
-		if err != nil {
-			log.Printf("Error waiting for index creation: %v", err)
-			return index
+// withRetry executes an operation with retry logic
+func (m *MeiliSearch) withRetry(operation string, fn func() error) error {
+	var lastErr error
+	for i := 0; i <= m.maxRetries; i++ {
+		if i > 0 {
+			log.Printf("Retrying %s (attempt %d/%d) after error: %v", operation, i, m.maxRetries, lastErr)
+			time.Sleep(m.retryDelay * time.Duration(i)) // Exponential backoff
 		}
 
-		// Configure index settings
-		_, err = index.UpdateSearchableAttributes(&[]string{
+		if err := fn(); err != nil {
+			lastErr = err
+			continue
+		}
+		return nil // Success
+	}
+	return fmt.Errorf("failed after %d retries: %v", m.maxRetries, lastErr)
+}
+
+// getGroupIndex gets or creates an index for a specific group
+func (m *MeiliSearch) getGroupIndex(chatID int64) string {
+	return fmt.Sprintf("messages_group_%d", chatID)
+}
+
+// configureIndex configures the settings for an index
+func (m *MeiliSearch) configureIndex(indexName string) error {
+	index := m.client.Index(indexName)
+
+	// Configure index settings
+	settings := &meilisearch.Settings{
+		SearchableAttributes: []string{
 			"text",
 			"username",
-		})
-		if err != nil {
-			log.Printf("Error updating searchable attributes: %v", err)
-		}
-
-		// Update sortable attributes
-		_, err = index.UpdateSortableAttributes(&[]string{
+		},
+		FilterableAttributes: []string{
+			"chat_id",
+			"message_id",
+			"user_id",
+			"username",
+			"created_at",
+		},
+		SortableAttributes: []string{
 			"created_at",
 			"message_id",
-		})
-		if err != nil {
-			log.Printf("Error updating sortable attributes: %v", err)
-		}
-
-		// Wait for settings to be applied
-		tasks, err := index.GetTasks(&meilisearch.TasksQuery{
-			Types: []meilisearch.TaskType{meilisearch.TaskTypeSettingsUpdate},
-		})
-		if err != nil {
-			log.Printf("Error getting tasks: %v", err)
-		} else {
-			for _, task := range tasks.Results {
-				_, err = m.client.WaitForTask(task.UID)
-				if err != nil {
-					log.Printf("Error waiting for task %d: %v", task.UID, err)
-				}
-			}
-		}
+		},
 	}
-	
-	return index
+
+	// Update index settings
+	_, err := index.UpdateSettings(settings)
+	if err != nil {
+		return fmt.Errorf("failed to update index settings: %v", err)
+	}
+
+	return nil
 }
 
-// IndexMessage indexes a message in the appropriate group index
+// IndexMessage indexes a message in Meilisearch
 func (m *MeiliSearch) IndexMessage(msg *models.Message) error {
-	index := m.getGroupIndex(msg.ChatID)
-	
-	// Create a document for indexing with a unique message_uid field
+	// Get the index for this group
+	indexName := m.getGroupIndex(msg.ChatID)
+	index := m.client.Index(indexName)
+
+	// Configure index settings first
+	if err := m.configureIndex(indexName); err != nil {
+		return fmt.Errorf("failed to configure index: %v", err)
+	}
+
+	// Create a unique ID for the message that includes both chat ID and message ID
+	messageUID := fmt.Sprintf("%d-%d", msg.ChatID, msg.MessageID)
+
+	// Create document to index
 	document := map[string]interface{}{
-		"message_uid": fmt.Sprintf("%d-%d", msg.ChatID, msg.MessageID), // Primary key
-		"message_id": msg.MessageID,
-		"chat_id":    msg.ChatID,
-		"user_id":    msg.UserID,
-		"username":   msg.Username,
-		"text":       msg.Text,
-		"created_at": msg.CreatedAt.Unix(), // Store as Unix timestamp for better sorting
+		"message_uid": messageUID,
+		"message_id":  msg.MessageID,
+		"chat_id":     msg.ChatID,
+		"user_id":     msg.UserID,
+		"username":    msg.Username,
+		"text":        msg.Text,
+		"created_at":  msg.CreatedAt.Unix(), // Store as Unix timestamp for sorting
 	}
 
-	// Debug log
-	log.Printf("Indexing document: %+v", document)
-
-	// Add the document
-	task, err := index.AddDocuments([]map[string]interface{}{document})
+	// Add document to index
+	_, err := index.AddDocuments([]map[string]interface{}{document})
 	if err != nil {
-		log.Printf("Error adding document: %v", err)
-		return err
+		return fmt.Errorf("failed to add document: %v", err)
 	}
 
-	// Wait for indexing to complete
-	_, err = m.client.WaitForTask(task.TaskUID)
-	return err
+	return nil
 }
 
-// SearchMessages searches for messages in a specific group
-func (m *MeiliSearch) SearchMessages(groupID int64, req *meilisearch.SearchRequest) ([]models.Message, error) {
-	// Try to get messages from both possible indices (in case of group migration)
-	var allMessages []models.Message
-	
-	// First try the current group ID
-	currentIndex := m.getGroupIndex(groupID)
-	result, err := currentIndex.Search(req.Query, req)
-	if err != nil {
-		log.Printf("Error searching current index: %v", err)
-	} else {
-		messages := m.convertHitsToMessages(result.Hits)
-		allMessages = append(allMessages, messages...)
-	}
-	
-	// If this is a supergroup (starts with -100), also try the old group ID
-	if groupID < -1000000000000 {
-		oldGroupID := -1 * (groupID + 1000000000000) // Convert back from supergroup ID to regular group ID
-		oldIndex := m.getGroupIndex(oldGroupID)
-		result, err := oldIndex.Search(req.Query, req)
-		if err != nil {
-			log.Printf("Error searching old index: %v", err)
-		} else {
-			messages := m.convertHitsToMessages(result.Hits)
-			allMessages = append(allMessages, messages...)
-		}
-	}
-	
-	// Sort all messages by time
-	sort.Slice(allMessages, func(i, j int) bool {
-		return allMessages[i].CreatedAt.After(allMessages[j].CreatedAt)
-	})
-	
-	return allMessages, nil
-}
+// SearchMessages searches for messages in a group's index
+func (m *MeiliSearch) SearchMessages(chatID int64, searchReq *meilisearch.SearchRequest) ([]models.Message, error) {
+	indexName := m.getGroupIndex(chatID)
 
-// convertHitsToMessages converts search hits to Message objects
-func (m *MeiliSearch) convertHitsToMessages(hits []interface{}) []models.Message {
+	// Configure index settings
+	if err := m.configureIndex(indexName); err != nil {
+		return nil, fmt.Errorf("failed to configure index: %v", err)
+	}
+
+	// Perform search
+	index := m.client.Index(indexName)
+	searchRes, err := index.Search("", searchReq)
+	if err != nil {
+		return nil, fmt.Errorf("search failed: %v", err)
+	}
+
+	// Convert hits to messages
 	var messages []models.Message
-	for _, hit := range hits {
-		if doc, ok := hit.(map[string]interface{}); ok {
-			message := models.Message{}
-			
-			// More defensive type conversion with logging
-			if msgID, ok := doc["message_id"].(float64); ok {
-				message.MessageID = int64(msgID)
-				log.Printf("Converted message_id: %v", message.MessageID)
-			} else {
-				log.Printf("Warning: Could not convert message_id: %v (%T)", doc["message_id"], doc["message_id"])
-				continue
-			}
-			if chatID, ok := doc["chat_id"].(float64); ok {
-				message.ChatID = int64(chatID)
-				log.Printf("Converted chat_id: %v", message.ChatID)
-			} else {
-				log.Printf("Warning: Could not convert chat_id: %v (%T)", doc["chat_id"], doc["chat_id"])
-				continue
-			}
-			if userID, ok := doc["user_id"].(float64); ok {
-				message.UserID = int64(userID)
-			}
-			if username, ok := doc["username"].(string); ok {
-				message.Username = username
-				log.Printf("Found username: %v", message.Username)
-			} else {
-				log.Printf("Warning: Could not get username: %v (%T)", doc["username"], doc["username"])
-				continue
-			}
-			if text, ok := doc["text"].(string); ok {
-				message.Text = text
-				log.Printf("Found text: %v", message.Text)
-			} else {
-				log.Printf("Warning: Could not get text: %v (%T)", doc["text"], doc["text"])
-				continue
-			}
-			if timestamp, ok := doc["created_at"].(float64); ok {
-				message.CreatedAt = time.Unix(int64(timestamp), 0)
-			}
-			
-			messages = append(messages, message)
-			log.Printf("Successfully converted and added message: %+v", message)
-		} else {
-			log.Printf("Warning: Could not convert hit to document: %+v (%T)", hit, hit)
+	for _, hit := range searchRes.Hits {
+		msg := models.Message{}
+
+		// Convert map[string]interface{} to Message struct
+		if messageID, ok := hit.(map[string]interface{})["message_id"].(float64); ok {
+			msg.MessageID = int64(messageID)
 		}
+		if chatID, ok := hit.(map[string]interface{})["chat_id"].(float64); ok {
+			msg.ChatID = int64(chatID)
+		}
+		if userID, ok := hit.(map[string]interface{})["user_id"].(float64); ok {
+			msg.UserID = int64(userID)
+		}
+		if username, ok := hit.(map[string]interface{})["username"].(string); ok {
+			msg.Username = username
+		}
+		if text, ok := hit.(map[string]interface{})["text"].(string); ok {
+			msg.Text = text
+		}
+		if timestamp, ok := hit.(map[string]interface{})["created_at"].(float64); ok {
+			msg.CreatedAt = time.Unix(int64(timestamp), 0)
+		}
+
+		messages = append(messages, msg)
 	}
-	return messages
+
+	return messages, nil
 }
 
 // fetchMessageContext fetches messages before and after each message to provide conversation context
 func (m *MeiliSearch) fetchMessageContext(messages []models.Message) ([]models.Message, error) {
 	const contextWindow = 30 * time.Second // Reduced from 2 minutes to 30 seconds for tighter context
-	
+
 	// Create a map to track unique messages
 	uniqueMessages := make(map[string]models.Message)
-	
+
 	// Add original messages to the map
 	for _, msg := range messages {
 		uniqueMessages[msg.GetSearchID()] = msg
 	}
-	
+
 	index := m.client.Index(m.baseIndexName)
-	
+
 	// For each message, fetch context
 	for _, msg := range messages {
 		// Create time range filter
 		beforeTime := msg.CreatedAt.Add(-contextWindow)
 		afterTime := msg.CreatedAt.Add(contextWindow)
-		
+
 		filter := fmt.Sprintf(
 			"chat_id = %d AND created_at >= %d AND created_at <= %d",
 			msg.ChatID,
 			beforeTime.Unix(),
 			afterTime.Unix(),
 		)
-		
+
 		// Search for context messages
 		contextReq := &meilisearch.SearchRequest{
 			Filter: filter,
-			Sort: []string{"created_at:asc"},
-			Limit: 5, // Reduced from 10 to 5 for more focused context
+			Sort:   []string{"created_at:asc"},
+			Limit:  5, // Reduced from 10 to 5 for more focused context
 		}
-		
+
 		result, err := index.Search("", contextReq)
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch context: %v", err)
 		}
-		
+
 		// Add context messages to the map
 		for _, hit := range result.Hits {
 			if doc, ok := hit.(map[string]interface{}); ok {
 				message := models.Message{}
-				
+
 				if msgID, ok := doc["message_id"].(float64); ok {
 					message.MessageID = int64(msgID)
 				}
@@ -278,23 +240,23 @@ func (m *MeiliSearch) fetchMessageContext(messages []models.Message) ([]models.M
 				if timestamp, ok := doc["created_at"].(float64); ok {
 					message.CreatedAt = time.Unix(int64(timestamp), 0)
 				}
-				
+
 				uniqueMessages[message.GetSearchID()] = message
 			}
 		}
 	}
-	
+
 	// Convert map back to slice
 	var result []models.Message
 	for _, msg := range uniqueMessages {
 		result = append(result, msg)
 	}
-	
+
 	// Sort by time
 	sort.Slice(result, func(i, j int) bool {
 		return result[i].CreatedAt.Before(result[j].CreatedAt)
 	})
-	
+
 	return result, nil
 }
 
@@ -319,4 +281,4 @@ func isCommonWord(word string) bool {
 		"those": true, "only": true, "very": true, "also": true, "just": true,
 	}
 	return commonWords[word]
-} 
+}

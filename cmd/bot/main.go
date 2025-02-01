@@ -19,10 +19,10 @@ import (
 )
 
 var (
-	mongoStorage *storage.MongoStorage
-	meiliSearch *search.MeiliSearch
-	geminiAI    *ai.GeminiAI
-	searchBot   *bot.Bot
+	mongoStorage storage.MessageStorage
+	meiliSearch  *search.MeiliSearch
+	geminiAI     *ai.GeminiAI
+	searchBot    *bot.Bot
 )
 
 func init() {
@@ -34,22 +34,33 @@ func init() {
 	// Initialize MongoDB
 	mongoURI := os.Getenv("MONGODB_URI")
 	if mongoURI == "" {
-		mongoURI = "mongodb://localhost:27017"
+		log.Fatal("MONGODB_URI is not set in .env file")
 	}
 
-	var err error
-	mongoStorage, err = storage.NewMongoStorage(mongoURI, "telegram_bot", "messages")
+	log.Printf("Connecting to MongoDB...")
+
+	// Initialize MongoDB storage with longer timeout
+	mongoStore, err := storage.NewMongoDB(mongoURI, "telegram_bot", "messages")
 	if err != nil {
 		log.Fatal("Failed to connect to MongoDB:", err)
 	}
+	mongoStorage = mongoStore
+	log.Printf("Successfully connected to MongoDB")
 
 	// Initialize Meilisearch
 	meiliHost := os.Getenv("MEILI_HOST")
+	log.Printf("Meilisearch Host from env: %s", meiliHost)
 	if meiliHost == "" {
 		meiliHost = "http://localhost:7700"
+		log.Printf("Warning: MEILI_HOST not set, using default: %s", meiliHost)
 	}
 	meiliKey := os.Getenv("MEILI_KEY")
+	log.Printf("Meilisearch Key length: %d", len(meiliKey))
+	if meiliKey == "" {
+		log.Printf("Warning: MEILI_KEY not set")
+	}
 	meiliSearch = search.NewMeiliSearch(meiliHost, meiliKey, "messages")
+	log.Printf("Initialized Meilisearch with host: %s", meiliHost)
 
 	// Initialize Gemini AI
 	geminiKey := os.Getenv("GEMINI_API_KEY")
@@ -57,10 +68,12 @@ func init() {
 		log.Fatal("GEMINI_API_KEY is not set in .env file")
 	}
 
-	geminiAI, err = ai.NewGeminiAI(geminiKey)
+	// Initialize Gemini AI client
+	geminiClient, err := ai.NewGeminiAI(geminiKey)
 	if err != nil {
 		log.Fatal("Failed to initialize Gemini AI:", err)
 	}
+	geminiAI = geminiClient
 }
 
 func main() {
@@ -79,8 +92,8 @@ func main() {
 	api.Debug = true
 	log.Printf("Authorized on account %s", api.Self.UserName)
 
-	// Initialize bot handler
-	searchBot = bot.NewBot(api, geminiAI, meiliSearch)
+	// Create bot instance
+	searchBot = bot.NewBot(api, geminiAI, meiliSearch, mongoStorage)
 
 	// Set up updates configuration
 	updateConfig := tgbotapi.NewUpdate(0)
@@ -123,12 +136,12 @@ func handleChatMemberUpdate(api *tgbotapi.BotAPI, update *tgbotapi.ChatMemberUpd
 		switch update.NewChatMember.Status {
 		case "member", "administrator":
 			// Bot was added to group or made admin
-			msg := tgbotapi.NewMessage(update.Chat.ID, 
+			msg := tgbotapi.NewMessage(update.Chat.ID,
 				"Thanks for adding me! I'll start indexing recent messages.\n\n"+
-				"Required permissions:\n"+
-				"- Read Messages\n"+
-				"- Send Messages\n\n"+
-				"Use /help to see available commands.")
+					"Required permissions:\n"+
+					"- Read Messages\n"+
+					"- Send Messages\n\n"+
+					"Use /help to see available commands.")
 			if _, err := api.Send(msg); err != nil {
 				log.Printf("Error sending welcome message: %v", err)
 			}
@@ -191,7 +204,7 @@ func handleCommand(api *tgbotapi.BotAPI, message *tgbotapi.Message) {
 					UserID: api.Self.ID,
 				},
 			}
-			
+
 			member, err := api.GetChatMember(chatMemberConfig)
 			if err != nil {
 				msg.Text = "Error checking bot status."
@@ -199,7 +212,7 @@ func handleCommand(api *tgbotapi.BotAPI, message *tgbotapi.Message) {
 			} else {
 				msg.Text = fmt.Sprintf("Bot Status in this group:\n"+
 					"Role: %s\n", member.Status)
-				
+
 				if member.Status == "administrator" {
 					msg.Text += "✅ Bot is properly configured with admin access.\n"
 				} else {
@@ -219,10 +232,10 @@ func handleCommand(api *tgbotapi.BotAPI, message *tgbotapi.Message) {
 		} else {
 			// Create search request
 			searchReq := &meilisearch.SearchRequest{
-				Query: query,
-				Limit: 50,
+				Query:                query,
+				Limit:                50,
 				AttributesToSearchOn: []string{"text"},
-				Sort: []string{"created_at:desc"},
+				Sort:                 []string{"created_at:desc"},
 			}
 
 			results, err := meiliSearch.SearchMessages(message.Chat.ID, searchReq)
@@ -241,10 +254,7 @@ func handleCommand(api *tgbotapi.BotAPI, message *tgbotapi.Message) {
 	case "ask":
 		if err := searchBot.HandleAskCommand(context.Background(), message); err != nil {
 			log.Printf("Error handling ask command: %v", err)
-			msg.Text = "An error occurred while processing your question."
-			if _, err := api.Send(msg); err != nil {
-				log.Printf("Error sending error message: %v", err)
-			}
+			msg.Text = "Sorry, an error occurred while processing your question."
 		}
 		return
 	default:
@@ -256,24 +266,30 @@ func handleCommand(api *tgbotapi.BotAPI, message *tgbotapi.Message) {
 	}
 }
 
-func storeMessage(msg *tgbotapi.Message) {
+func storeMessage(message *tgbotapi.Message) error {
 	// Create message model
-	message := &models.Message{
-		MessageID: int64(msg.MessageID),
-		ChatID:    msg.Chat.ID,
-		UserID:    int64(msg.From.ID),
-		Username:  msg.From.UserName,
-		Text:      msg.Text,
-		CreatedAt: time.Unix(int64(msg.Date), 0),
+	msg := &models.Message{
+		MessageID:    int64(message.MessageID),
+		ChatID:       message.Chat.ID,
+		ChatUsername: message.Chat.UserName,
+		UserID:       message.From.ID,
+		Username:     message.From.UserName,
+		Text:         message.Text,
+		CreatedAt:    time.Now(),
 	}
 
 	// Store in MongoDB
-	if err := mongoStorage.StoreMessage(message); err != nil {
-		log.Printf("Error storing message in MongoDB: %v", err)
+	if err := mongoStorage.StoreMessage(msg); err != nil {
+		log.Printf("Failed to store message: %v", err)
+		return err
 	}
 
 	// Index in Meilisearch
-	if err := meiliSearch.IndexMessage(message); err != nil {
-		log.Printf("Error indexing message in Meilisearch: %v", err)
+	if err := meiliSearch.IndexMessage(msg); err != nil {
+		log.Printf("Failed to index message: %v", err)
+		return err
 	}
+
+	log.Printf("Successfully processed message: %d", msg.MessageID)
+	return nil
 }

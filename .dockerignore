@@ -1,0 +1,33 @@
+# Git
+.git
+.gitignore
+
+# Development
+*.md
+*.log
+.env
+.env.*
+tmp/
+temp/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build
+bin/
+dist/
+vendor/
+
+# Testing
+*_test.go
+test/
+tests/
+coverage.txt
+
+# Misc
+.DS_Store
+*.bak
+*.tmp 
