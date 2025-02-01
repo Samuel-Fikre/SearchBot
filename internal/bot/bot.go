@@ -68,6 +68,8 @@ func (b *Bot) HandleAskCommand(ctx context.Context, msg *tgbotapi.Message) error
 		return b.sendMessage(msg.Chat.ID, "Please provide a question after /ask")
 	}
 
+	log.Printf("Processing question: %s", question)
+
 	// First, fetch recent messages from the database
 	searchReq := &meilisearch.SearchRequest{
 		Query: "",  // Empty query to get all messages
@@ -80,6 +82,8 @@ func (b *Bot) HandleAskCommand(ctx context.Context, msg *tgbotapi.Message) error
 	if err != nil {
 		return fmt.Errorf("failed to fetch messages: %v", err)
 	}
+
+	log.Printf("Found %d messages in database", len(messages))
 
 	if len(messages) == 0 {
 		return b.sendMessage(msg.Chat.ID, 
@@ -95,6 +99,8 @@ func (b *Bot) HandleAskCommand(ctx context.Context, msg *tgbotapi.Message) error
 	for _, message := range messages {
 		messagesText.WriteString(fmt.Sprintf("@%s: %s\n", message.Username, message.Text))
 	}
+
+	log.Printf("Sending %d messages to AI for analysis", len(messages))
 
 	// Let AI analyze the messages and user's question
 	analysisPrompt := fmt.Sprintf(`You are an intelligent search assistant for a coding group chat.
@@ -135,6 +141,8 @@ Remember:
 		return fmt.Errorf("failed to analyze messages: %v", err)
 	}
 
+	log.Printf("Received AI analysis response: %s", analysis)
+
 	// Clean and parse the AI response
 	analysis = cleanJSONResponse(analysis)
 	
@@ -143,8 +151,23 @@ Remember:
 		Explanation      string   `json:"explanation"`
 	}
 	if err := json.Unmarshal([]byte(analysis), &result); err != nil {
-		return fmt.Errorf("failed to parse analysis: %v", err)
+		log.Printf("Failed to parse AI response: %v", err)
+		log.Printf("Raw response: %s", analysis)
+		// Try to recover by searching for messages ourselves
+		keywords := extractSignificantTerms(question)
+		for _, message := range messages {
+			messageTerms := extractSignificantTerms(message.Text)
+			if hasCommonTerms(keywords, messageTerms) {
+				result.RelevantMessages = append(result.RelevantMessages, 
+					fmt.Sprintf("@%s: %s", message.Username, message.Text))
+			}
+		}
+		if len(result.RelevantMessages) > 0 {
+			result.Explanation = "Found some messages that might be relevant to your question."
+		}
 	}
+
+	log.Printf("Found %d relevant messages", len(result.RelevantMessages))
 
 	// If no relevant messages found in AI response, try to find them ourselves
 	if len(result.RelevantMessages) == 0 {
@@ -184,19 +207,27 @@ Remember:
 	for _, relevantMsg := range result.RelevantMessages {
 		parts := strings.SplitN(relevantMsg, ": ", 2)
 		if len(parts) != 2 {
+			log.Printf("Skipping malformed message: %s", relevantMsg)
 			continue
 		}
 		username := strings.TrimPrefix(parts[0], "@")
 		messageText := parts[1]
 
 		// Find the corresponding message
+		found := false
 		for _, m := range messages {
 			if m.Username == username && m.Text == messageText {
 				relevantMessages = append(relevantMessages, m)
+				found = true
 				break
 			}
 		}
+		if !found {
+			log.Printf("Could not find original message for: @%s: %s", username, messageText)
+		}
 	}
+
+	log.Printf("Successfully mapped %d relevant messages to original messages", len(relevantMessages))
 
 	// Group messages by username
 	for _, msg := range relevantMessages {
@@ -216,6 +247,8 @@ Remember:
 	if len(currentConversation) > 0 {
 		allConversations = append(allConversations, currentConversation)
 	}
+
+	log.Printf("Grouped messages into %d conversations", len(allConversations))
 
 	// Format conversations with numbers
 	for i, conversation := range allConversations {
@@ -269,7 +302,12 @@ Remember:
 	replyMsg.Entities = entities
 	replyMsg.ParseMode = "" // Ensure no parsing mode interferes with our entities
 	_, err = b.api.Send(replyMsg)
-	return err
+	if err != nil {
+		log.Printf("Failed to send response: %v", err)
+		// Try sending without entities as fallback
+		return b.sendMessage(msg.Chat.ID, response.String())
+	}
+	return nil
 }
 
 // cleanJSONResponse cleans up the AI's response to extract valid JSON
@@ -508,4 +546,68 @@ func isCommonWord(word string) bool {
 		"something": true, "nothing": true, "nobody": true, "none": true,
 	}
 	return commonWords[word]
+}
+
+// GetChatHistory fetches recent messages from a chat
+func (b *Bot) GetChatHistory(chatID int64, limit int) ([]tgbotapi.Message, error) {
+	var allMessages []tgbotapi.Message
+	
+	// Get chat member info to verify permissions
+	chatMember, err := b.api.GetChatMember(tgbotapi.GetChatMemberConfig{
+		ChatConfigWithUser: tgbotapi.ChatConfigWithUser{
+			ChatID: chatID,
+			UserID: b.api.Self.ID,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to check bot permissions: %v", err)
+	}
+
+	// Check if bot has necessary permissions
+	if chatMember.Status != "administrator" {
+		return nil, fmt.Errorf("bot needs to be an administrator to access message history")
+	}
+
+	// Send a temporary message to get current message ID
+	msg := tgbotapi.NewMessage(chatID, "🔍 Fetching message history...")
+	sentMsg, err := b.api.Send(msg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send message: %v", err)
+	}
+
+	// Delete the temporary message
+	deleteMsg := tgbotapi.NewDeleteMessage(chatID, sentMsg.MessageID)
+	b.api.Request(deleteMsg)
+
+	// Iterate through recent message IDs
+	for i := 1; i <= limit; i++ {
+		msgID := sentMsg.MessageID - i
+		if msgID <= 0 {
+			break
+		}
+
+		// Try to get the message by replying to it
+		getMsg := tgbotapi.NewMessage(chatID, ".")
+		getMsg.ReplyToMessageID = msgID
+		
+		msg, err := b.api.Send(getMsg)
+		if err != nil {
+			// Skip messages we can't access
+			continue
+		}
+
+		// If we got a reply, that means we can access the original message
+		if msg.ReplyToMessage != nil && msg.ReplyToMessage.Text != "" {
+			allMessages = append(allMessages, *msg.ReplyToMessage)
+		}
+		
+		// Delete our message
+		deleteMsg = tgbotapi.NewDeleteMessage(chatID, msg.MessageID)
+		b.api.Request(deleteMsg)
+
+		// Rate limiting
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	return allMessages, nil
 } 
