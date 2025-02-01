@@ -124,13 +124,47 @@ func handleChatMemberUpdate(api *tgbotapi.BotAPI, update *tgbotapi.ChatMemberUpd
 		case "member", "administrator":
 			// Bot was added to group or made admin
 			msg := tgbotapi.NewMessage(update.Chat.ID, 
-				"Thanks for adding me! Please make me an administrator with access to messages to enable full functionality.\n\n"+
+				"Thanks for adding me! I'll start indexing recent messages.\n\n"+
 				"Required permissions:\n"+
 				"- Read Messages\n"+
 				"- Send Messages\n\n"+
 				"Use /help to see available commands.")
 			if _, err := api.Send(msg); err != nil {
 				log.Printf("Error sending welcome message: %v", err)
+			}
+
+			// Fetch recent messages if bot is admin
+			if update.NewChatMember.Status == "administrator" {
+				go func() {
+					// Get chat history using our helper
+					messages, err := searchBot.GetChatHistory(update.Chat.ID, 100)
+					if err != nil {
+						log.Printf("Error fetching chat history: %v", err)
+						errorMsg := tgbotapi.NewMessage(update.Chat.ID,
+							"❌ Failed to fetch chat history. Please make sure I have the correct permissions.")
+						if _, err := api.Send(errorMsg); err != nil {
+							log.Printf("Error sending error message: %v", err)
+						}
+						return
+					}
+
+					// Store messages in reverse order (oldest first)
+					storedCount := 0
+					for i := len(messages) - 1; i >= 0; i-- {
+						msg := messages[i]
+						if msg.Text != "" { // Only store text messages
+							storeMessage(&msg)
+							storedCount++
+						}
+					}
+
+					// Send confirmation
+					confirmMsg := tgbotapi.NewMessage(update.Chat.ID,
+						fmt.Sprintf("✅ Successfully indexed %d text messages from the chat history.", storedCount))
+					if _, err := api.Send(confirmMsg); err != nil {
+						log.Printf("Error sending confirmation message: %v", err)
+					}
+				}()
 			}
 		}
 	}
@@ -191,7 +225,7 @@ func handleCommand(api *tgbotapi.BotAPI, message *tgbotapi.Message) {
 				Sort: []string{"created_at:desc"},
 			}
 
-			results, err := meiliSearch.SearchMessages(context.Background(), searchReq)
+			results, err := meiliSearch.SearchMessages(message.Chat.ID, searchReq)
 			if err != nil {
 				msg.Text = "Sorry, an error occurred while searching."
 				log.Printf("Search error: %v", err)

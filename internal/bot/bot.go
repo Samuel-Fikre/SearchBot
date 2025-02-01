@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"time"
@@ -41,11 +42,33 @@ func (b *Bot) sendMessage(chatID int64, text string) error {
 
 // HandleAskCommand handles the /ask command
 func (b *Bot) HandleAskCommand(ctx context.Context, msg *tgbotapi.Message) error {
+	// First check if bot has necessary permissions
+	chatMember, err := b.api.GetChatMember(tgbotapi.GetChatMemberConfig{
+		ChatConfigWithUser: tgbotapi.ChatConfigWithUser{
+			ChatID: msg.Chat.ID,
+			UserID: b.api.Self.ID,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to check bot permissions: %v", err)
+	}
+
+	// Check if bot is admin and has message access
+	if chatMember.Status != "administrator" {
+		return b.sendMessage(msg.Chat.ID, 
+			"⚠️ I need to be an administrator to access message history.\n"+
+			"Please make me an administrator with these permissions:\n"+
+			"- Read Messages\n"+
+			"- Send Messages")
+	}
+
 	// Extract the question from the message
 	question := strings.TrimSpace(strings.TrimPrefix(msg.Text, "/ask"))
 	if question == "" {
 		return b.sendMessage(msg.Chat.ID, "Please provide a question after /ask")
 	}
+
+	log.Printf("Processing question: %s", question)
 
 	// First, fetch recent messages from the database
 	searchReq := &meilisearch.SearchRequest{
@@ -55,9 +78,20 @@ func (b *Bot) HandleAskCommand(ctx context.Context, msg *tgbotapi.Message) error
 		Sort: []string{"created_at:desc"}, // Most recent first
 	}
 	
-	messages, err := b.search.SearchMessages(ctx, searchReq)
+	messages, err := b.search.SearchMessages(msg.Chat.ID, searchReq)
 	if err != nil {
 		return fmt.Errorf("failed to fetch messages: %v", err)
+	}
+
+	log.Printf("Found %d messages in database", len(messages))
+
+	if len(messages) == 0 {
+		return b.sendMessage(msg.Chat.ID, 
+			"I don't have any messages in my database yet. "+
+			"This could be because:\n"+
+			"1. I was just added to the group\n"+
+			"2. I don't have access to read messages\n"+
+			"Please make sure I'm an administrator with message access and wait for new messages to be indexed.")
 	}
 
 	// Format all messages for AI analysis
@@ -65,6 +99,8 @@ func (b *Bot) HandleAskCommand(ctx context.Context, msg *tgbotapi.Message) error
 	for _, message := range messages {
 		messagesText.WriteString(fmt.Sprintf("@%s: %s\n", message.Username, message.Text))
 	}
+
+	log.Printf("Sending %d messages to AI for analysis", len(messages))
 
 	// Let AI analyze the messages and user's question
 	analysisPrompt := fmt.Sprintf(`You are an intelligent search assistant for a coding group chat.
@@ -89,17 +125,23 @@ When you find relevant messages:
 1. Explain WHY these messages are relevant to their question
 2. Point out the semantic connections (e.g. "DeepSeek is an AI model that was discussed here")
 3. Include enough context to understand the discussion
+4. IMPORTANT: You MUST include the EXACT messages in your response, including username and text
 
 Your response must be a raw JSON object with NO FORMATTING AT ALL.
 Example: {"relevant_messages":["@username: exact message text"],"explanation":"why these messages are helpful"}
 
-Remember: Focus on finding messages that would actually help them, even if the messages use completely different terminology.`, 
+Remember: 
+1. Focus on finding messages that would actually help them, even if the messages use completely different terminology
+2. You MUST include the EXACT messages in your response, do not paraphrase or summarize them
+3. Include ALL relevant messages, even if they seem similar`, 
 		question, messagesText.String())
 
 	analysis, err := b.ai.AnswerQuestion(ctx, analysisPrompt, nil)
 	if err != nil {
 		return fmt.Errorf("failed to analyze messages: %v", err)
 	}
+
+	log.Printf("Received AI analysis response: %s", analysis)
 
 	// Clean and parse the AI response
 	analysis = cleanJSONResponse(analysis)
@@ -109,10 +151,38 @@ Remember: Focus on finding messages that would actually help them, even if the m
 		Explanation      string   `json:"explanation"`
 	}
 	if err := json.Unmarshal([]byte(analysis), &result); err != nil {
-		return fmt.Errorf("failed to parse analysis: %v", err)
+		log.Printf("Failed to parse AI response: %v", err)
+		log.Printf("Raw response: %s", analysis)
+		// Try to recover by searching for messages ourselves
+		keywords := extractSignificantTerms(question)
+		for _, message := range messages {
+			messageTerms := extractSignificantTerms(message.Text)
+			if hasCommonTerms(keywords, messageTerms) {
+				result.RelevantMessages = append(result.RelevantMessages, 
+					fmt.Sprintf("@%s: %s", message.Username, message.Text))
+			}
+		}
+		if len(result.RelevantMessages) > 0 {
+			result.Explanation = "Found some messages that might be relevant to your question."
+		}
 	}
 
-	// If no relevant messages found
+	log.Printf("Found %d relevant messages", len(result.RelevantMessages))
+
+	// If no relevant messages found in AI response, try to find them ourselves
+	if len(result.RelevantMessages) == 0 {
+		// Search for messages containing keywords from the question
+		keywords := extractSignificantTerms(question)
+		for _, message := range messages {
+			messageTerms := extractSignificantTerms(message.Text)
+			if hasCommonTerms(keywords, messageTerms) {
+				result.RelevantMessages = append(result.RelevantMessages, 
+					fmt.Sprintf("@%s: %s", message.Username, message.Text))
+			}
+		}
+	}
+
+	// If still no relevant messages found
 	if len(result.RelevantMessages) == 0 {
 		return b.sendMessage(msg.Chat.ID, "I couldn't find any relevant discussions about this topic in our chat history. You might be the first one to bring this up!")
 	}
@@ -122,13 +192,122 @@ Remember: Focus on finding messages that would actually help them, even if the m
 	response.WriteString(result.Explanation)
 	response.WriteString("\n\nHere are the relevant discussions:\n\n")
 	
-	for i, relevantMsg := range result.RelevantMessages {
-		response.WriteString(fmt.Sprintf("%d. %s\n", i+1, relevantMsg))
+	// Create message entities for clickable links
+	var entities []tgbotapi.MessageEntity
+
+	baseOffset := len(result.Explanation) + len("\n\nHere are the relevant discussions:\n\n")
+	
+	// Group messages by conversation
+	var currentUsername string
+	var currentConversation []models.Message
+	var allConversations [][]models.Message
+
+	// First, convert relevant messages to actual Message objects
+	var relevantMessages []models.Message
+	for _, relevantMsg := range result.RelevantMessages {
+		parts := strings.SplitN(relevantMsg, ": ", 2)
+		if len(parts) != 2 {
+			log.Printf("Skipping malformed message: %s", relevantMsg)
+			continue
+		}
+		username := strings.TrimPrefix(parts[0], "@")
+		messageText := parts[1]
+
+		// Find the corresponding message
+		found := false
+		for _, m := range messages {
+			if m.Username == username && m.Text == messageText {
+				relevantMessages = append(relevantMessages, m)
+				found = true
+				break
+			}
+		}
+		if !found {
+			log.Printf("Could not find original message for: @%s: %s", username, messageText)
+		}
+	}
+
+	log.Printf("Successfully mapped %d relevant messages to original messages", len(relevantMessages))
+
+	// Group messages by username
+	for _, msg := range relevantMessages {
+		if currentUsername == "" {
+			currentUsername = msg.Username
+		}
+		
+		if msg.Username != currentUsername {
+			if len(currentConversation) > 0 {
+				allConversations = append(allConversations, currentConversation)
+				currentConversation = nil
+			}
+			currentUsername = msg.Username
+		}
+		currentConversation = append(currentConversation, msg)
+	}
+	if len(currentConversation) > 0 {
+		allConversations = append(allConversations, currentConversation)
+	}
+
+	log.Printf("Grouped messages into %d conversations", len(allConversations))
+
+	// Format conversations with numbers
+	for i, conversation := range allConversations {
+		// Format the conversation
+		for j, message := range conversation {
+			// Format the message
+			var fullMessage string
+			if j == 0 {
+				fullMessage = fmt.Sprintf("%d. @%s: %s\n", i+1, message.Username, message.Text)
+			} else {
+				fullMessage = fmt.Sprintf("@%s: %s\n", message.Username, message.Text)
+			}
+			response.WriteString(fullMessage)
+
+			// Create a text_link entity for the entire message line
+			chatIDStr := fmt.Sprintf("%d", message.ChatID)
+			// For supergroups, remove the -100 prefix and any remaining minus sign
+			log.Printf("Original chatID: %s", chatIDStr)
+			if strings.HasPrefix(chatIDStr, "-100") {
+				chatIDStr = chatIDStr[4:] // Remove -100 prefix
+			} else if strings.HasPrefix(chatIDStr, "-") {
+				chatIDStr = chatIDStr[1:] // Remove single - prefix
+			}
+			log.Printf("Final chatID: %s, messageID: %d", chatIDStr, message.MessageID)
+			
+			// Add text_link entity for the entire message line
+			messageURL := fmt.Sprintf("https://t.me/c/%s/%d", chatIDStr, message.MessageID)
+			log.Printf("Generated URL: %s", messageURL)
+			entities = append(entities, tgbotapi.MessageEntity{
+				Type:   "text_link",
+				Offset: baseOffset,
+				Length: len(fullMessage) - 1, // -1 to exclude the newline
+				URL:    messageURL,
+			})
+			
+			baseOffset += len(fullMessage)
+		}
+		
+		// Add a newline between conversations
+		if i < len(allConversations)-1 {
+			response.WriteString("\n")
+			baseOffset += 1
+		}
 	}
 	
-	response.WriteString("\nTip: You can click on any message to jump to that part of the chat history.")
-	
-	return b.sendMessage(msg.Chat.ID, response.String())
+	response.WriteString("\nTip: Click on any message to jump to that part of the chat history. "+
+		"(Make sure I'm an administrator to access message history)")
+
+	// Send message with entities
+	replyMsg := tgbotapi.NewMessage(msg.Chat.ID, response.String())
+	replyMsg.Entities = entities
+	replyMsg.ParseMode = "" // Ensure no parsing mode interferes with our entities
+	_, err = b.api.Send(replyMsg)
+	if err != nil {
+		log.Printf("Failed to send response: %v", err)
+		// Try sending without entities as fallback
+		return b.sendMessage(msg.Chat.ID, response.String())
+	}
+	return nil
 }
 
 // cleanJSONResponse cleans up the AI's response to extract valid JSON
@@ -367,4 +546,68 @@ func isCommonWord(word string) bool {
 		"something": true, "nothing": true, "nobody": true, "none": true,
 	}
 	return commonWords[word]
+}
+
+// GetChatHistory fetches recent messages from a chat
+func (b *Bot) GetChatHistory(chatID int64, limit int) ([]tgbotapi.Message, error) {
+	var allMessages []tgbotapi.Message
+	
+	// Get chat member info to verify permissions
+	chatMember, err := b.api.GetChatMember(tgbotapi.GetChatMemberConfig{
+		ChatConfigWithUser: tgbotapi.ChatConfigWithUser{
+			ChatID: chatID,
+			UserID: b.api.Self.ID,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to check bot permissions: %v", err)
+	}
+
+	// Check if bot has necessary permissions
+	if chatMember.Status != "administrator" {
+		return nil, fmt.Errorf("bot needs to be an administrator to access message history")
+	}
+
+	// Send a temporary message to get current message ID
+	msg := tgbotapi.NewMessage(chatID, "🔍 Fetching message history...")
+	sentMsg, err := b.api.Send(msg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send message: %v", err)
+	}
+
+	// Delete the temporary message
+	deleteMsg := tgbotapi.NewDeleteMessage(chatID, sentMsg.MessageID)
+	b.api.Request(deleteMsg)
+
+	// Iterate through recent message IDs
+	for i := 1; i <= limit; i++ {
+		msgID := sentMsg.MessageID - i
+		if msgID <= 0 {
+			break
+		}
+
+		// Try to get the message by replying to it
+		getMsg := tgbotapi.NewMessage(chatID, ".")
+		getMsg.ReplyToMessageID = msgID
+		
+		msg, err := b.api.Send(getMsg)
+		if err != nil {
+			// Skip messages we can't access
+			continue
+		}
+
+		// If we got a reply, that means we can access the original message
+		if msg.ReplyToMessage != nil && msg.ReplyToMessage.Text != "" {
+			allMessages = append(allMessages, *msg.ReplyToMessage)
+		}
+		
+		// Delete our message
+		deleteMsg = tgbotapi.NewDeleteMessage(chatID, msg.MessageID)
+		b.api.Request(deleteMsg)
+
+		// Rate limiting
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	return allMessages, nil
 } 
